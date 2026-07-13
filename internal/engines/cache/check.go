@@ -48,7 +48,7 @@ func NewCheckEngineWithCache(
 // For each entity, the cache is checked individually; uncached entities are delegated to the underlying checker.
 func (c *CheckEngineWithCache) Check(ctx context.Context, request *invoke.BatchCheckRequest) (response *invoke.BatchCheckResponse, err error) {
 	// Read entity definition once (all entities share the same type)
-	en, _, err := c.schemaReader.ReadEntityDefinition(ctx, request.TenantID, request.EntityType, request.Metadata.GetSchemaVersion())
+	en, _, err := c.schemaReader.ReadEntityDefinition(ctx, request.TenantID, request.Metadata.GetSharedSchemaId(), request.EntityType, request.Metadata.GetSchemaVersion())
 	if err != nil {
 		return invoke.NewBatchCheckResponse(base.CheckResult_CHECK_RESULT_DENIED, request.EntityIDs...), err
 	}

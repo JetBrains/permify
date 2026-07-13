@@ -5703,6 +5703,8 @@ func (m *Tenant) validate(all bool) error {
 		}
 	}
 
+	// no validation rules for SharedSchemaId
+
 	if len(errors) > 0 {
 		return TenantMultiError(errors)
 	}

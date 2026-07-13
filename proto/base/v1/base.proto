@@ -509,6 +509,7 @@ message Tenant {
   string id = 1 [json_name = "id"]; // The ID of the tenant.
   string name = 2 [json_name = "name"]; // The name of the tenant.
   google.protobuf.Timestamp created_at = 3 [json_name = "created_at"]; // The time at which the tenant was created.
+  string shared_schema_id = 4 [json_name = "shared_schema_id"]; // The shared schema ID assigned to this tenant, empty if using per-tenant schema.
 }
 
 // DataChanges represent changes in data with a snap token and a list of data change objects.

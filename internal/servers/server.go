@@ -61,6 +61,10 @@ type Container struct {
 	TR storage.TenantReader
 	// TenantWriter for writing tenant information to storage
 	TW storage.TenantWriter
+	// SharedSchemaReader for reading shared schemas from storage
+	SSR storage.SharedSchemaReader
+	// SharedSchemaWriter for writing shared schemas to storage
+	SSW storage.SharedSchemaWriter
 
 	W storage.Watcher
 
@@ -81,6 +85,8 @@ func NewContainer(
 	sw storage.SchemaWriter,
 	tr storage.TenantReader,
 	tw storage.TenantWriter,
+	ssr storage.SharedSchemaReader,
+	ssw storage.SharedSchemaWriter,
 	w storage.Watcher,
 ) *Container {
 	return &Container{
@@ -93,6 +99,8 @@ func NewContainer(
 		SW:      sw,
 		TR:      tr,
 		TW:      tw,
+		SSR:     ssr,
+		SSW:     ssw,
 		W:       w,
 	}
 }
@@ -180,6 +188,7 @@ func (s *Container) Run(
 	grpcV1.RegisterDataServer(grpcServer, NewDataServer(s.DR, s.DW, s.BR, s.SR))
 	grpcV1.RegisterBundleServer(grpcServer, NewBundleServer(s.BR, s.BW))
 	grpcV1.RegisterTenancyServer(grpcServer, NewTenancyServer(s.TR, s.TW))
+	grpcV1.RegisterSharedSchemaServer(grpcServer, NewSharedSchemaServer(s.SSW, s.SSR))
 	grpcV1.RegisterWatchServer(grpcServer, NewWatchServer(s.W, s.DR))
 
 	// Register health check and reflection services for gRPC.
@@ -330,6 +339,9 @@ func (s *Container) Run(
 			return err
 		}
 		if err = grpcV1.RegisterTenancyHandler(ctx, mux, conn); err != nil {
+			return err
+		}
+		if err = grpcV1.RegisterSharedSchemaHandler(ctx, mux, conn); err != nil {
 			return err
 		}
 

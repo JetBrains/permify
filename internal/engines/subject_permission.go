@@ -35,7 +35,7 @@ func (engine *SubjectPermissionEngine) SubjectPermission(ctx context.Context, re
 
 	// The schema definition for the entity is read from the engine's schemaReader.
 	// The tenant ID, entity type, and schema version are all taken from the request.
-	en, _, err := engine.schemaReader.ReadEntityDefinition(ctx, request.GetTenantId(), request.GetEntity().GetType(), request.GetMetadata().GetSchemaVersion())
+	en, _, err := engine.schemaReader.ReadEntityDefinition(ctx, request.GetTenantId(), request.GetMetadata().GetSharedSchemaId(), request.GetEntity().GetType(), request.GetMetadata().GetSchemaVersion())
 	if err != nil {
 		// If there's an error reading the schema definition, we wrap it and return.
 		return emptyResp, err
@@ -93,9 +93,10 @@ func (engine *SubjectPermissionEngine) SubjectPermission(ctx context.Context, re
 				Permission: permission,
 				Subject:    request.GetSubject(),
 				Metadata: &base.PermissionCheckRequestMetadata{
-					SchemaVersion: request.GetMetadata().GetSchemaVersion(),
-					SnapToken:     request.GetMetadata().GetSnapToken(),
-					Depth:         request.GetMetadata().GetDepth(),
+					SchemaVersion:  request.GetMetadata().GetSchemaVersion(),
+					SharedSchemaId: request.GetMetadata().GetSharedSchemaId(),
+					SnapToken:      request.GetMetadata().GetSnapToken(),
+					Depth:          request.GetMetadata().GetDepth(),
 				},
 				Context: request.GetContext(),
 			})

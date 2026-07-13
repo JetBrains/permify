@@ -64,9 +64,10 @@ func (engine *EntityFilter) EntityFilter(
 
 			// If the entity reference is the same as the subject, publish the result directly and return.
 			publisher.Publish(found, &base.PermissionCheckRequestMetadata{
-				SnapToken:     request.GetMetadata().GetSnapToken(),
-				SchemaVersion: request.GetMetadata().GetSchemaVersion(),
-				Depth:         request.GetMetadata().GetDepth(),
+				SnapToken:      request.GetMetadata().GetSnapToken(),
+				SchemaVersion:  request.GetMetadata().GetSchemaVersion(),
+				SharedSchemaId: request.GetMetadata().GetSharedSchemaId(),
+				Depth:          request.GetMetadata().GetDepth(),
 			}, request.GetContext(), base.CheckResult_CHECK_RESULT_UNSPECIFIED)
 		}
 	}
@@ -195,9 +196,10 @@ func (engine *EntityFilter) attributeEntrance(
 		}
 
 		publisher.Publish(entity, &base.PermissionCheckRequestMetadata{
-			SnapToken:     request.GetMetadata().GetSnapToken(),
-			SchemaVersion: request.GetMetadata().GetSchemaVersion(),
-			Depth:         request.GetMetadata().GetDepth(),
+			SnapToken:      request.GetMetadata().GetSnapToken(),
+			SchemaVersion:  request.GetMetadata().GetSchemaVersion(),
+			SharedSchemaId: request.GetMetadata().GetSharedSchemaId(),
+			Depth:          request.GetMetadata().GetDepth(),
 		}, request.GetContext(), base.CheckResult_CHECK_RESULT_UNSPECIFIED)
 	}
 
@@ -436,9 +438,10 @@ func (engine *EntityFilter) processFoundEntities(
 					continue
 				}
 				publisher.Publish(entity, &base.PermissionCheckRequestMetadata{
-					SnapToken:     request.GetMetadata().GetSnapToken(),
-					SchemaVersion: request.GetMetadata().GetSchemaVersion(),
-					Depth:         request.GetMetadata().GetDepth(),
+					SnapToken:      request.GetMetadata().GetSnapToken(),
+					SchemaVersion:  request.GetMetadata().GetSchemaVersion(),
+					SharedSchemaId: request.GetMetadata().GetSharedSchemaId(),
+					Depth:          request.GetMetadata().GetDepth(),
 				}, request.GetContext(), base.CheckResult_CHECK_RESULT_UNSPECIFIED)
 			}
 		}
@@ -611,9 +614,10 @@ func (engine *EntityFilter) pathChainEntrance(
 		}
 
 		publisher.Publish(entity, &base.PermissionCheckRequestMetadata{
-			SnapToken:     request.GetMetadata().GetSnapToken(),
-			SchemaVersion: request.GetMetadata().GetSchemaVersion(),
-			Depth:         request.GetMetadata().GetDepth(),
+			SnapToken:      request.GetMetadata().GetSnapToken(),
+			SchemaVersion:  request.GetMetadata().GetSchemaVersion(),
+			SharedSchemaId: request.GetMetadata().GetSharedSchemaId(),
+			Depth:          request.GetMetadata().GetDepth(),
 		}, request.GetContext(), base.CheckResult_CHECK_RESULT_UNSPECIFIED)
 	}
 

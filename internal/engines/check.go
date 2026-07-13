@@ -70,7 +70,7 @@ func (engine *CheckEngine) Check(ctx context.Context, request *invoke.BatchCheck
 
 	// Read entity definition once (all entities share the same type)
 	var en *base.EntityDefinition
-	en, _, err = engine.schemaReader.ReadEntityDefinition(ctx, request.TenantID, request.EntityType, request.Metadata.GetSchemaVersion())
+	en, _, err = engine.schemaReader.ReadEntityDefinition(ctx, request.TenantID, request.Metadata.GetSharedSchemaId(), request.EntityType, request.Metadata.GetSchemaVersion())
 	if err != nil {
 		return deniedResp, err
 	}
@@ -624,7 +624,7 @@ func (engine *CheckEngine) checkDirectCall(request *invoke.BatchCheckRequest) Ch
 
 		// Read the rule definition from the schema once (shared across all entities).
 		var ru *base.RuleDefinition
-		ru, _, err := engine.schemaReader.ReadRuleDefinition(ctx, request.TenantID, request.Permission, request.Metadata.GetSchemaVersion())
+		ru, _, err := engine.schemaReader.ReadRuleDefinition(ctx, request.TenantID, request.Metadata.GetSharedSchemaId(), request.Permission, request.Metadata.GetSchemaVersion())
 		if err != nil {
 			return resp, err
 		}
