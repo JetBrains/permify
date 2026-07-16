@@ -100,7 +100,7 @@ var _ = Describe("GarbageCollector", func() {
 
 			checkEngine.SetInvoker(invoker)
 
-			checkRes1, err := invoker.Check(ctx, &base.PermissionCheckRequest{
+			checkRes1, err := invoker.Check(ctx, invoke.NewBatchCheckRequest(&base.PermissionCheckRequest{
 				Metadata: &base.PermissionCheckRequestMetadata{
 					SnapToken:     "",
 					SchemaVersion: "",
@@ -116,9 +116,9 @@ var _ = Describe("GarbageCollector", func() {
 					Type: "user",
 					Id:   "b56661f8-7be6-4342-a4c0-918ee04e5983",
 				},
-			})
+			}))
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(checkRes1.Can).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
+			Expect(checkRes1.UnionResult()).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
 
 			// Step 5: Delete the data
 			_, err = dataWriter.Delete(ctx, tenantID, &base.TupleFilter{
@@ -130,7 +130,7 @@ var _ = Describe("GarbageCollector", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// Step 6: Perform a permission check (expected to be invalid)
-			checkRes2, err := invoker.Check(ctx, &base.PermissionCheckRequest{
+			checkRes2, err := invoker.Check(ctx, invoke.NewBatchCheckRequest(&base.PermissionCheckRequest{
 				Metadata: &base.PermissionCheckRequestMetadata{
 					SnapToken:     "",
 					SchemaVersion: "",
@@ -146,9 +146,9 @@ var _ = Describe("GarbageCollector", func() {
 					Type: "user",
 					Id:   "b56661f8-7be6-4342-a4c0-918ee04e5983",
 				},
-			})
+			}))
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(checkRes2.Can).Should(Equal(base.CheckResult_CHECK_RESULT_DENIED))
+			Expect(checkRes2.UnionResult()).Should(Equal(base.CheckResult_CHECK_RESULT_DENIED))
 
 			// Step 7: Insert the same data again
 			tup2, err := tuple.Tuple("organisation:1#member@user:b56661f8-7be6-4342-a4c0-918ee04e5983")
@@ -158,7 +158,7 @@ var _ = Describe("GarbageCollector", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// Step 8: Perform a permission check (expected to be valid)
-			checkRes3, err := invoker.Check(ctx, &base.PermissionCheckRequest{
+			checkRes3, err := invoker.Check(ctx, invoke.NewBatchCheckRequest(&base.PermissionCheckRequest{
 				Metadata: &base.PermissionCheckRequestMetadata{
 					SnapToken:     "",
 					SchemaVersion: "",
@@ -174,9 +174,9 @@ var _ = Describe("GarbageCollector", func() {
 					Type: "user",
 					Id:   "b56661f8-7be6-4342-a4c0-918ee04e5983",
 				},
-			})
+			}))
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(checkRes3.Can).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
+			Expect(checkRes3.UnionResult()).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
 
 			// Step 9: Run the garbage collector
 			time.Sleep(5 * time.Second) // Pause for 5 seconds
@@ -184,7 +184,7 @@ var _ = Describe("GarbageCollector", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// Step 10: Perform a permission check after GC (expected to be valid)
-			checkRes4, err := invoker.Check(ctx, &base.PermissionCheckRequest{
+			checkRes4, err := invoker.Check(ctx, invoke.NewBatchCheckRequest(&base.PermissionCheckRequest{
 				Metadata: &base.PermissionCheckRequestMetadata{
 					SnapToken:     "",
 					SchemaVersion: "",
@@ -200,9 +200,9 @@ var _ = Describe("GarbageCollector", func() {
 					Type: "user",
 					Id:   "b56661f8-7be6-4342-a4c0-918ee04e5983",
 				},
-			})
+			}))
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(checkRes4.Can).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
+			Expect(checkRes4.UnionResult()).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
 		})
 
 		It("should perform tenant-aware garbage collection correctly", func() {
@@ -253,7 +253,7 @@ var _ = Describe("GarbageCollector", func() {
 			checkEngine.SetInvoker(invoker)
 
 			// Check tenant A
-			checkResA, err := invoker.Check(ctx, &base.PermissionCheckRequest{
+			checkResA, err := invoker.Check(ctx, invoke.NewBatchCheckRequest(&base.PermissionCheckRequest{
 				Metadata: &base.PermissionCheckRequestMetadata{
 					SnapToken:     "",
 					SchemaVersion: "",
@@ -269,12 +269,12 @@ var _ = Describe("GarbageCollector", func() {
 					Type: "user",
 					Id:   "user-a",
 				},
-			})
+			}))
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(checkResA.Can).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
+			Expect(checkResA.UnionResult()).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
 
 			// Check tenant B
-			checkResB, err := invoker.Check(ctx, &base.PermissionCheckRequest{
+			checkResB, err := invoker.Check(ctx, invoke.NewBatchCheckRequest(&base.PermissionCheckRequest{
 				Metadata: &base.PermissionCheckRequestMetadata{
 					SnapToken:     "",
 					SchemaVersion: "",
@@ -290,9 +290,9 @@ var _ = Describe("GarbageCollector", func() {
 					Type: "user",
 					Id:   "user-b",
 				},
-			})
+			}))
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(checkResB.Can).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
+			Expect(checkResB.UnionResult()).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
 
 			// Step 5: Delete data for tenant A only
 			_, err = dataWriter.Delete(ctx, tenantA, &base.TupleFilter{
@@ -309,7 +309,7 @@ var _ = Describe("GarbageCollector", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// Step 7: Verify tenant A's permission is denied (data was deleted)
-			checkResA2, err := invoker.Check(ctx, &base.PermissionCheckRequest{
+			checkResA2, err := invoker.Check(ctx, invoke.NewBatchCheckRequest(&base.PermissionCheckRequest{
 				Metadata: &base.PermissionCheckRequestMetadata{
 					SnapToken:     "",
 					SchemaVersion: "",
@@ -325,12 +325,12 @@ var _ = Describe("GarbageCollector", func() {
 					Type: "user",
 					Id:   "user-a",
 				},
-			})
+			}))
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(checkResA2.Can).Should(Equal(base.CheckResult_CHECK_RESULT_DENIED))
+			Expect(checkResA2.UnionResult()).Should(Equal(base.CheckResult_CHECK_RESULT_DENIED))
 
 			// Step 8: Verify tenant B's permission is still allowed (data was not affected by GC)
-			checkResB2, err := invoker.Check(ctx, &base.PermissionCheckRequest{
+			checkResB2, err := invoker.Check(ctx, invoke.NewBatchCheckRequest(&base.PermissionCheckRequest{
 				Metadata: &base.PermissionCheckRequestMetadata{
 					SnapToken:     "",
 					SchemaVersion: "",
@@ -346,9 +346,9 @@ var _ = Describe("GarbageCollector", func() {
 					Type: "user",
 					Id:   "user-b",
 				},
-			})
+			}))
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(checkResB2.Can).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
+			Expect(checkResB2.UnionResult()).Should(Equal(base.CheckResult_CHECK_RESULT_ALLOWED))
 		})
 	})
 
