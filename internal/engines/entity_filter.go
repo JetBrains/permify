@@ -172,6 +172,12 @@ func (engine *EntityFilter) attributeEntrance(
 
 	it := database.NewUniqueAttributeIterator(rit, cti)
 
+	// Only publish entities of the target type (the type we're looking up).
+	// Attribute entrances on intermediate types are not candidates.
+	if entrance.TargetEntrance.GetType() != request.GetEntrance().GetType() {
+		return nil
+	}
+
 	// Publish entities directly for regular case
 	for it.HasNext() {
 		current, ok := it.GetNext()
