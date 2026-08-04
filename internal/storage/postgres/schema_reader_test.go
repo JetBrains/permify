@@ -526,7 +526,7 @@ var _ = Describe("SchemaReader", func() {
 
 				readerWithClosedDB := NewSchemaReader(closedDB)
 
-				_, _, _ = readerWithClosedDB.HeadVersion(ctx, "t1")
+				_, _, err = readerWithClosedDB.HeadVersion(ctx, "t1")
 				Expect(err).Should(HaveOccurred())
 				Expect(err.Error()).Should(Or(
 					Equal(base.ErrorCode_ERROR_CODE_SQL_BUILDER.String()),
@@ -554,7 +554,7 @@ var _ = Describe("SchemaReader", func() {
 
 				readerWithClosedDB := NewSchemaReader(closedDB)
 
-				_, _, _ = readerWithClosedDB.HeadVersion(ctx, "t1")
+				_, _, err = readerWithClosedDB.HeadVersion(ctx, "t1")
 				Expect(err).Should(HaveOccurred())
 				Expect(err.Error()).Should(Or(
 					Equal(base.ErrorCode_ERROR_CODE_SQL_BUILDER.String()),
