@@ -2507,12 +2507,13 @@ func (x *Subjects) GetSubjects() []*Subject {
 
 // Tenant represents a tenant with an id, a name, and a timestamp indicating when it was created.
 type Tenant struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`                 // The ID of the tenant.
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`             // The name of the tenant.
-	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=created_at,proto3" json:"created_at,omitempty"` // The time at which the tenant was created.
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Id             string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`                             // The ID of the tenant.
+	Name           string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`                         // The name of the tenant.
+	CreatedAt      *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=created_at,proto3" json:"created_at,omitempty"`             // The time at which the tenant was created.
+	SharedSchemaId string                 `protobuf:"bytes,4,opt,name=shared_schema_id,proto3" json:"shared_schema_id,omitempty"` // The shared schema ID assigned to this tenant, empty if using per-tenant schema.
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Tenant) Reset() {
@@ -2564,6 +2565,13 @@ func (x *Tenant) GetCreatedAt() *timestamppb.Timestamp {
 		return x.CreatedAt
 	}
 	return nil
+}
+
+func (x *Tenant) GetSharedSchemaId() string {
+	if x != nil {
+		return x.SharedSchemaId
+	}
+	return ""
 }
 
 // DataChanges represent changes in data with a snap token and a list of data change objects.
@@ -3460,13 +3468,14 @@ const file_base_v1_base_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.google.protobuf.AnyR\x05value:\x028\x01\"8\n" +
 	"\bSubjects\x12,\n" +
-	"\bsubjects\x18\x01 \x03(\v2\x10.base.v1.SubjectR\bsubjects\"h\n" +
+	"\bsubjects\x18\x01 \x03(\v2\x10.base.v1.SubjectR\bsubjects\"\x94\x01\n" +
 	"\x06Tenant\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12:\n" +
 	"\n" +
 	"created_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"created_at\"f\n" +
+	"created_at\x12*\n" +
+	"\x10shared_schema_id\x18\x04 \x01(\tR\x10shared_schema_id\"f\n" +
 	"\vDataChanges\x12\x1e\n" +
 	"\n" +
 	"snap_token\x18\x01 \x01(\tR\n" +

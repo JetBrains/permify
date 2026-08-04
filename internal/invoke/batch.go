@@ -125,9 +125,10 @@ func (r *BatchCheckRequest) Clone() *BatchCheckRequest {
 func (r *BatchCheckRequest) CloneWithDepth(depth int32) *BatchCheckRequest {
 	c := r.Clone()
 	c.Metadata = &base.PermissionCheckRequestMetadata{
-		SchemaVersion: r.Metadata.GetSchemaVersion(),
-		SnapToken:     r.Metadata.GetSnapToken(),
-		Depth:         depth,
+		SchemaVersion:  r.Metadata.GetSchemaVersion(),
+		SharedSchemaId: r.Metadata.GetSharedSchemaId(),
+		SnapToken:      r.Metadata.GetSnapToken(),
+		Depth:          depth,
 	}
 	return c
 }

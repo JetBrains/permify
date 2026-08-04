@@ -120,7 +120,7 @@ func (c *Balancer) Check(ctx context.Context, request *invoke.BatchCheckRequest)
 	deniedResp := invoke.NewBatchCheckResponse(base.CheckResult_CHECK_RESULT_DENIED, request.EntityIDs...)
 
 	// Read entity definition once (shared across all entity IDs).
-	en, _, err := c.schemaReader.ReadEntityDefinition(ctx, request.TenantID, request.EntityType, request.Metadata.GetSchemaVersion())
+	en, _, err := c.schemaReader.ReadEntityDefinition(ctx, request.TenantID, request.Metadata.GetSharedSchemaId(), request.EntityType, request.Metadata.GetSchemaVersion())
 	if err != nil {
 		slog.ErrorContext(ctx, err.Error())
 		return deniedResp, err

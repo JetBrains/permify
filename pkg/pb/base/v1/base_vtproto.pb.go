@@ -900,6 +900,7 @@ func (m *Tenant) CloneVT() *Tenant {
 	r.Id = m.Id
 	r.Name = m.Name
 	r.CreatedAt = (*timestamppb.Timestamp)((*timestamppb1.Timestamp)(m.CreatedAt).CloneVT())
+	r.SharedSchemaId = m.SharedSchemaId
 	if len(m.unknownFields) > 0 {
 		r.unknownFields = make([]byte, len(m.unknownFields))
 		copy(r.unknownFields, m.unknownFields)
@@ -2616,6 +2617,9 @@ func (this *Tenant) EqualVT(that *Tenant) bool {
 		return false
 	}
 	if !(*timestamppb1.Timestamp)(this.CreatedAt).EqualVT((*timestamppb1.Timestamp)(that.CreatedAt)) {
+		return false
+	}
+	if this.SharedSchemaId != that.SharedSchemaId {
 		return false
 	}
 	return string(this.unknownFields) == string(that.unknownFields)
@@ -5211,6 +5215,13 @@ func (m *Tenant) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if len(m.SharedSchemaId) > 0 {
+		i -= len(m.SharedSchemaId)
+		copy(dAtA[i:], m.SharedSchemaId)
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(len(m.SharedSchemaId)))
+		i--
+		dAtA[i] = 0x22
+	}
 	if m.CreatedAt != nil {
 		size, err := (*timestamppb1.Timestamp)(m.CreatedAt).MarshalToSizedBufferVT(dAtA[:i])
 		if err != nil {
@@ -6812,6 +6823,10 @@ func (m *Tenant) SizeVT() (n int) {
 	}
 	if m.CreatedAt != nil {
 		l = (*timestamppb1.Timestamp)(m.CreatedAt).SizeVT()
+		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
+	l = len(m.SharedSchemaId)
+	if l > 0 {
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
 	n += len(m.unknownFields)
@@ -12386,6 +12401,38 @@ func (m *Tenant) UnmarshalVT(dAtA []byte) error {
 			if err := (*timestamppb1.Timestamp)(m.CreatedAt).UnmarshalVT(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
+			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SharedSchemaId", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return protohelpers.ErrInvalidLength
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.SharedSchemaId = string(dAtA[iNdEx:postIndex])
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex

@@ -71,19 +71,34 @@ func (e SchemaDefinition) Serialized() string {
 	return string(e.SerializedDefinition)
 }
 
+// SharedSchemaDefinition - Structure for Shared Schema Definition
+type SharedSchemaDefinition struct {
+	SharedSchemaID       string
+	Name                 string
+	SerializedDefinition []byte
+	Version              string
+}
+
+// Serialized - get shared schema serialized definition
+func (e SharedSchemaDefinition) Serialized() string {
+	return string(e.SerializedDefinition)
+}
+
 // Tenant - Structure for tenant
 type Tenant struct {
-	ID        string
-	Name      string
-	CreatedAt time.Time
+	ID             string
+	Name           string
+	CreatedAt      time.Time
+	SharedSchemaID string // empty string means no shared schema (per-tenant mode)
 }
 
 // ToTenant - Convert database tenant to base tenant
 func (r Tenant) ToTenant() *base.Tenant {
 	return &base.Tenant{
-		Id:        r.ID,
-		Name:      r.Name,
-		CreatedAt: timestamppb.New(r.CreatedAt),
+		Id:             r.ID,
+		Name:           r.Name,
+		CreatedAt:      timestamppb.New(r.CreatedAt),
+		SharedSchemaId: r.SharedSchemaID,
 	}
 }
 
