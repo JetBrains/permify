@@ -1759,12 +1759,34 @@ var _ = Describe("expand-engine", func() {
 
 			// The tree should contain user:owner1 (direct owner) and
 			// user:u1, user:u2, user:u3 (via parent.member through 3 groups).
-			// We don't assert the exact tree structure since child ordering
-			// from map iteration is non-deterministic, but we verify the
-			// tree is valid and contains the expected subjects.
+			subjects := map[string]struct{}{}
+			var walk func(e *base.Expand)
+			walk = func(e *base.Expand) {
+				if e == nil {
+					return
+				}
+				if leaf := e.GetLeaf(); leaf != nil {
+					if subs := leaf.GetSubjects(); subs != nil {
+						for _, s := range subs.GetSubjects() {
+							subjects[tuple.SubjectToString(s)] = struct{}{}
+						}
+					}
+				}
+				if node := e.GetExpand(); node != nil {
+					for _, c := range node.GetChildren() {
+						walk(c)
+					}
+				}
+			}
+			walk(response.Tree)
+
 			Expect(response.Tree.Entity.Type).Should(Equal("doc"))
 			Expect(response.Tree.Entity.Id).Should(Equal("1"))
 			Expect(response.Tree.Permission).Should(Equal("read"))
+			Expect(subjects).Should(HaveKey("user:owner1"))
+			Expect(subjects).Should(HaveKey("user:u1"))
+			Expect(subjects).Should(HaveKey("user:u2"))
+			Expect(subjects).Should(HaveKey("user:u3"))
 		})
 
 		It("should produce correct results with maxBatchSize=1 (no batching)", func() {
