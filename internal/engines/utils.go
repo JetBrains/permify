@@ -52,6 +52,23 @@ func LookupMaxBatchSize(size int) LookupOption {
 	}
 }
 
+// ExpandOption - a functional option type for configuring the ExpandEngine.
+type ExpandOption func(engine *ExpandEngine)
+
+// ExpandConcurrencyLimit - a functional option that sets the concurrency limit for the ExpandEngine.
+func ExpandConcurrencyLimit(limit int) ExpandOption {
+	return func(e *ExpandEngine) {
+		e.concurrencyLimit = limit
+	}
+}
+
+// ExpandMaxBatchSize - a functional option that sets the maximum batch size for the ExpandEngine.
+func ExpandMaxBatchSize(size int) ExpandOption {
+	return func(e *ExpandEngine) {
+		e.maxBatchSize = size
+	}
+}
+
 // SubjectFilterOption - a functional option type for configuring the LookupSubjectEngine.
 type SubjectFilterOption func(engine *SubjectFilter)
 

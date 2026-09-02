@@ -22,16 +22,26 @@ type ExpandEngine struct {
 	schemaReader storage.SchemaReader
 	// relationshipReader is responsible for reading relationship information
 	dataReader storage.DataReader
+	// concurrencyLimit is the maximum number of concurrent goroutines per expandOperation call
+	concurrencyLimit int
+	// maxBatchSize is the maximum number of entity IDs per batched DB query (IN clause)
+	maxBatchSize int
 }
 
 // NewExpandEngine - This function creates a new instance of ExpandEngine by taking a SchemaReader and a RelationshipReader as
 // parameters and returning a pointer to the created instance. The SchemaReader is used to read schema definitions, while the
 // RelationshipReader is used to read relationship definitions.
-func NewExpandEngine(sr storage.SchemaReader, rr storage.DataReader) *ExpandEngine {
-	return &ExpandEngine{
-		schemaReader: sr,
-		dataReader:   rr,
+func NewExpandEngine(sr storage.SchemaReader, rr storage.DataReader, opts ...ExpandOption) *ExpandEngine {
+	engine := &ExpandEngine{
+		schemaReader:     sr,
+		dataReader:       rr,
+		concurrencyLimit: _defaultConcurrencyLimit,
+		maxBatchSize:     _defaultMaxBatchSize,
 	}
+	for _, opt := range opts {
+		opt(engine)
+	}
+	return engine
 }
 
 // Expand - This is the Run function of the ExpandEngine type, which takes a context, a PermissionExpandRequest,
@@ -130,15 +140,15 @@ func (engine *ExpandEngine) expandRewrite(ctx context.Context, request *base.Per
 	switch rewrite.GetRewriteOperation() {
 	// If the operation is UNION, call the 'setChild' method with 'expandUnion' as the expand function.
 	case *base.Rewrite_OPERATION_UNION.Enum():
-		return engine.setChild(ctx, request, rewrite.GetChildren(), expandUnion)
+		return engine.setChild(ctx, request, rewrite.GetChildren(), engine.expandUnion)
 
 	// If the operation is INTERSECTION, call the 'setChild' method with 'expandIntersection' as the expand function.
 	case *base.Rewrite_OPERATION_INTERSECTION.Enum():
-		return engine.setChild(ctx, request, rewrite.GetChildren(), expandIntersection)
+		return engine.setChild(ctx, request, rewrite.GetChildren(), engine.expandIntersection)
 
 	// If the operation is EXCLUSION, call the 'setChild' method with 'expandExclusion' as the expand function.
 	case *base.Rewrite_OPERATION_EXCLUSION.Enum():
-		return engine.setChild(ctx, request, rewrite.GetChildren(), expandExclusion)
+		return engine.setChild(ctx, request, rewrite.GetChildren(), engine.expandExclusion)
 
 	// If the operation is not any of the defined types, return an error.
 	default:
@@ -297,32 +307,41 @@ func (engine *ExpandEngine) expandDirectRelation(request *base.PermissionExpandR
 			return
 		}
 
-		// Define a slice of ExpandFunction.
-		var expandFunctions []ExpandFunction
-
-		// Create an iterator for the foundedUserSets.
+		// Group userset subjects by (entityType, relation) for batched DB queries,
+		// preserving insertion order for deterministic tree output.
+		type expandGroupKey struct {
+			entityType string
+			relation   string
+		}
+		var groupOrder []expandGroupKey
+		usersetGroups := map[expandGroupKey][]string{}
 		si := foundedUserSets.CreateSubjectIterator()
-
-		// Iterate over the foundedUserSets.
 		for si.HasNext() {
 			sub := si.GetNext()
-			// For each subject, append a new function to the expandFunctions slice.
-			expandFunctions = append(expandFunctions, func(ctx context.Context, resultChan chan<- ExpandResponse) {
-				resultChan <- engine.expand(ctx, &base.PermissionExpandRequest{
-					TenantId: request.GetTenantId(),
-					Entity: &base.Entity{
-						Type: sub.GetType(),
-						Id:   sub.GetId(),
-					},
-					Permission: sub.GetRelation(),
-					Metadata:   request.GetMetadata(),
-					Context:    request.GetContext(),
-				})
-			})
+			key := expandGroupKey{entityType: sub.GetType(), relation: sub.GetRelation()}
+			if _, exists := usersetGroups[key]; !exists {
+				groupOrder = append(groupOrder, key)
+			}
+			usersetGroups[key] = append(usersetGroups[key], sub.GetId())
+		}
+
+		// For each group, chunk by maxBatchSize and create batched expand functions.
+		var expandFunctions []ExpandFunction
+		for _, key := range groupOrder {
+			ids := usersetGroups[key]
+			for i := 0; i < len(ids); i += engine.maxBatchSize {
+				end := min(i+engine.maxBatchSize, len(ids))
+				fns, err := engine.createBatchedExpandFunctions(ctx, request, key.entityType, ids[i:end], key.relation)
+				if err != nil {
+					expandChan <- expandFailResponse(err)
+					return
+				}
+				expandFunctions = append(expandFunctions, fns...)
+			}
 		}
 
 		// Use the expandUnion function to process the expandFunctions.
-		result := expandUnion(ctx, request.GetEntity(), request.GetPermission(), request.GetArguments(), expandFunctions)
+		result := engine.expandUnion(ctx, request.GetEntity(), request.GetPermission(), request.GetArguments(), expandFunctions)
 
 		// If an error occurred, send a failure response and return.
 		if result.Err != nil {
@@ -401,28 +420,39 @@ func (engine *ExpandEngine) expandTupleToUserSet(
 		// NewUniqueTupleIterator() ensures that the iterator only returns unique tuples.
 		it := database.NewUniqueTupleIterator(rit, cti)
 
-		var expandFunctions []ExpandFunction
+		// Group subjects by entityType for batched DB queries,
+		// preserving insertion order for deterministic tree output.
+		// All subjects share the same computed relation (ttu.GetComputed().GetRelation()).
+		var typeOrder []string
+		subjectsByType := map[string][]string{}
 		for it.HasNext() {
-			// Get the next tuple's subject.
 			next, ok := it.GetNext()
 			if !ok {
 				break
 			}
 			subject := next.GetSubject()
-
-			expandFunctions = append(expandFunctions, engine.expandComputedUserSet(&base.PermissionExpandRequest{
-				TenantId: request.GetTenantId(),
-				Entity: &base.Entity{
-					Type: subject.GetType(),
-					Id:   subject.GetId(),
-				},
-				Permission: subject.GetRelation(),
-				Metadata:   request.GetMetadata(),
-				Context:    request.GetContext(),
-			}, ttu.GetComputed()))
+			if _, exists := subjectsByType[subject.GetType()]; !exists {
+				typeOrder = append(typeOrder, subject.GetType())
+			}
+			subjectsByType[subject.GetType()] = append(subjectsByType[subject.GetType()], subject.GetId())
 		}
 
-		expandChan <- expandUnion(
+		computedRelation := ttu.GetComputed().GetRelation()
+		var expandFunctions []ExpandFunction
+		for _, entityType := range typeOrder {
+			ids := subjectsByType[entityType]
+			for i := 0; i < len(ids); i += engine.maxBatchSize {
+				end := min(i+engine.maxBatchSize, len(ids))
+				fns, err := engine.createBatchedExpandFunctions(ctx, request, entityType, ids[i:end], computedRelation)
+				if err != nil {
+					expandChan <- expandFailResponse(err)
+					return
+				}
+				expandFunctions = append(expandFunctions, fns...)
+			}
+		}
+
+		expandChan <- engine.expandUnion(
 			ctx,
 			request.GetEntity(),
 			ttu.GetTupleSet().GetRelation(),
@@ -430,6 +460,217 @@ func (engine *ExpandEngine) expandTupleToUserSet(
 			expandFunctions,
 		)
 	}
+}
+
+// createBatchedExpandFunctions creates per-entity ExpandFunctions for a batch of entities
+// that share the same type and permission. When the permission is a RELATION, it makes a
+// single batched DB query with IN (...) instead of one query per entity. For other reference
+// types (permissions, attributes, rules) it falls back to individual engine.expand() calls.
+func (engine *ExpandEngine) createBatchedExpandFunctions(
+	ctx context.Context,
+	parentRequest *base.PermissionExpandRequest,
+	entityType string,
+	entityIDs []string,
+	permission string,
+) ([]ExpandFunction, error) {
+	// Read entity definition once for the entire batch (all entities share the same type).
+	en, _, err := engine.schemaReader.ReadEntityDefinition(
+		ctx, parentRequest.GetTenantId(), parentRequest.GetMetadata().GetSharedSchemaId(),
+		entityType, parentRequest.GetMetadata().GetSchemaVersion(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tor, _ := schema.GetTypeOfReferenceByNameInEntityDefinition(en, permission)
+
+	// For non-relation references, fall back to individual expand() calls.
+	if tor != base.EntityDefinition_REFERENCE_RELATION {
+		var fns []ExpandFunction
+		for _, id := range entityIDs {
+			entityID := id
+			fns = append(fns, func(ctx context.Context, ch chan<- ExpandResponse) {
+				ch <- engine.expand(ctx, &base.PermissionExpandRequest{
+					TenantId:   parentRequest.GetTenantId(),
+					Entity:     &base.Entity{Type: entityType, Id: entityID},
+					Permission: permission,
+					Metadata:   parentRequest.GetMetadata(),
+					Context:    parentRequest.GetContext(),
+				})
+			})
+		}
+		return fns, nil
+	}
+
+	// RELATION: make a single batched DB query for all entities in the chunk.
+	filter := &base.TupleFilter{
+		Entity: &base.EntityFilter{
+			Type: entityType,
+			Ids:  entityIDs,
+		},
+		Relation: permission,
+	}
+
+	cti, err := storageContext.NewContextualTuples(parentRequest.GetContext().GetTuples()...).QueryRelationships(filter, database.NewCursorPagination())
+	if err != nil {
+		return nil, err
+	}
+
+	rit, err := engine.dataReader.QueryRelationships(ctx, parentRequest.GetTenantId(), filter, parentRequest.GetMetadata().GetSnapToken(), database.NewCursorPagination())
+	if err != nil {
+		return nil, err
+	}
+
+	it := database.NewUniqueTupleIterator(rit, cti)
+
+	// Distribute results per entity.
+	type entityExpandResult struct {
+		users    *database.SubjectCollection
+		userSets *database.SubjectCollection
+	}
+	perEntity := make(map[string]*entityExpandResult, len(entityIDs))
+
+	for it.HasNext() {
+		next, ok := it.GetNext()
+		if !ok {
+			break
+		}
+		parentID := next.GetEntity().GetId()
+		subject := next.GetSubject()
+
+		data := perEntity[parentID]
+		if data == nil {
+			data = &entityExpandResult{
+				users:    database.NewSubjectCollection(),
+				userSets: database.NewSubjectCollection(),
+			}
+			perEntity[parentID] = data
+		}
+
+		if tuple.IsDirectSubject(subject) || subject.GetRelation() == tuple.ELLIPSIS {
+			data.users.Add(subject)
+		} else {
+			data.userSets.Add(subject)
+		}
+	}
+
+	// Build per-entity expand functions using the pre-fetched data.
+	var fns []ExpandFunction
+	for _, entityID := range entityIDs {
+		entity := &base.Entity{Type: entityType, Id: entityID}
+		data := perEntity[entityID]
+
+		if data == nil {
+			// No relationships found — empty leaf.
+			ent := entity
+			fns = append(fns, func(ctx context.Context, ch chan<- ExpandResponse) {
+				ch <- ExpandResponse{
+					Response: &base.PermissionExpandResponse{
+						Tree: &base.Expand{
+							Entity:     ent,
+							Permission: permission,
+							Node: &base.Expand_Leaf{
+								Leaf: &base.ExpandLeaf{
+									Type: &base.ExpandLeaf_Subjects{
+										Subjects: &base.Subjects{},
+									},
+								},
+							},
+						},
+					},
+				}
+			})
+			continue
+		}
+
+		if len(data.userSets.GetSubjects()) == 0 {
+			// Only direct users — leaf node.
+			ent := entity
+			subjects := data.users.GetSubjects()
+			fns = append(fns, func(ctx context.Context, ch chan<- ExpandResponse) {
+				ch <- ExpandResponse{
+					Response: &base.PermissionExpandResponse{
+						Tree: &base.Expand{
+							Entity:     ent,
+							Permission: permission,
+							Node: &base.Expand_Leaf{
+								Leaf: &base.ExpandLeaf{
+									Type: &base.ExpandLeaf_Subjects{
+										Subjects: &base.Subjects{
+											Subjects: subjects,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+			})
+			continue
+		}
+
+		// Has usersets — group by (entityType, relation) and batch recursively.
+		ent := entity
+		eData := data
+		fns = append(fns, func(ctx context.Context, ch chan<- ExpandResponse) {
+			// Group next-level userset subjects by (entityType, relation) for batching.
+			type subGroupKey struct {
+				entityType string
+				relation   string
+			}
+			var subGroupOrder []subGroupKey
+			subGroups := map[subGroupKey][]string{}
+			subIter := eData.userSets.CreateSubjectIterator()
+			for subIter.HasNext() {
+				sub := subIter.GetNext()
+				key := subGroupKey{entityType: sub.GetType(), relation: sub.GetRelation()}
+				if _, exists := subGroups[key]; !exists {
+					subGroupOrder = append(subGroupOrder, key)
+				}
+				subGroups[key] = append(subGroups[key], sub.GetId())
+			}
+
+			var subFunctions []ExpandFunction
+			for _, key := range subGroupOrder {
+				ids := subGroups[key]
+				for i := 0; i < len(ids); i += engine.maxBatchSize {
+					end := min(i+engine.maxBatchSize, len(ids))
+					batchFns, err := engine.createBatchedExpandFunctions(ctx, parentRequest, key.entityType, ids[i:end], key.relation)
+					if err != nil {
+						ch <- expandFailResponse(err)
+						return
+					}
+					subFunctions = append(subFunctions, batchFns...)
+				}
+			}
+
+			result := engine.expandUnion(ctx, ent, permission, nil, subFunctions)
+			if result.Err != nil {
+				ch <- expandFailResponse(result.Err)
+				return
+			}
+
+			// Add users+usersets leaf as child (same as expandDirectRelation).
+			expand := result.Response.GetTree().GetExpand()
+			expand.Children = append(expand.Children, &base.Expand{
+				Entity:     ent,
+				Permission: permission,
+				Node: &base.Expand_Leaf{
+					Leaf: &base.ExpandLeaf{
+						Type: &base.ExpandLeaf_Subjects{
+							Subjects: &base.Subjects{
+								Subjects: append(eData.users.GetSubjects(), eData.userSets.GetSubjects()...),
+							},
+						},
+					},
+				},
+			})
+
+			ch <- result
+		})
+	}
+
+	return fns, nil
 }
 
 // expandComputedUserSet is an ExpandFunction that expands the computed user set for the given entity and relation filter.
@@ -694,7 +935,7 @@ func (engine *ExpandEngine) expandComputedAttribute(
 // 'expandOperation' is a function that takes a context, an entity, permission string,
 // a slice of arguments, slice of ExpandFunctions, and an operation of type base.ExpandTreeNode_Operation.
 // It returns an ExpandResponse.
-func expandOperation(
+func (engine *ExpandEngine) expandOperation(
 	ctx context.Context, // The context of this operation, which may carry deadlines, cancellation signals, etc.
 	entity *base.Entity, // The entity on which the operation will be performed.
 	permission string, // The permission string required for the operation.
@@ -733,14 +974,27 @@ func expandOperation(
 		cancel()
 	}()
 
+	// Limit concurrent goroutines within this expandOperation call.
+	// This prevents goroutine explosion when there are many expand functions.
+	// (Separate from the request-scoped DB semaphore in storage proxy layer.)
+	cl := make(chan struct{}, engine.concurrencyLimit)
+
 	// Initialize an empty slice of channels which will receive ExpandResponses.
 	results := make([]chan ExpandResponse, 0, len(functions))
-	// For each function, create a channel and add it to the results slice.
-	// Start a goroutine with the function and pass the cancelable context and the channel.
 	for _, fn := range functions {
 		fc := make(chan ExpandResponse, 1)
 		results = append(results, fc)
-		go fn(c, fc)
+
+		select {
+		case cl <- struct{}{}:
+		case <-c.Done():
+			return expandFailResponse(errors.New(base.ErrorCode_ERROR_CODE_CANCELLED.String()))
+		}
+
+		go func(f ExpandFunction, ch chan<- ExpandResponse) {
+			defer func() { <-cl }()
+			f(c, ch)
+		}(fn, fc)
 	}
 
 	// For each result channel, wait for a response or for the context to be cancelled.
@@ -816,14 +1070,14 @@ func expandRoot(ctx context.Context, fn ExpandFunction) ExpandResponse {
 //
 // Returns:
 //   - ExpandResponse containing the union of the expanded user sets, or an error if any of the ExpandFunctions failed
-func expandUnion(
+func (engine *ExpandEngine) expandUnion(
 	ctx context.Context,
 	entity *base.Entity,
 	permission string,
 	arguments []*base.Argument,
 	functions []ExpandFunction,
 ) ExpandResponse {
-	return expandOperation(ctx, entity, permission, arguments, functions, base.ExpandTreeNode_OPERATION_UNION)
+	return engine.expandOperation(ctx, entity, permission, arguments, functions, base.ExpandTreeNode_OPERATION_UNION)
 }
 
 // expandIntersection is a helper function that executes multiple ExpandFunctions in parallel and returns an ExpandResponse
@@ -838,14 +1092,14 @@ func expandUnion(
 //
 // Returns:
 //   - ExpandResponse containing the intersection of the expanded user sets, or an error if any of the ExpandFunctions failed
-func expandIntersection(
+func (engine *ExpandEngine) expandIntersection(
 	ctx context.Context,
 	entity *base.Entity,
 	permission string,
 	arguments []*base.Argument,
 	functions []ExpandFunction,
 ) ExpandResponse {
-	return expandOperation(ctx, entity, permission, arguments, functions, base.ExpandTreeNode_OPERATION_INTERSECTION)
+	return engine.expandOperation(ctx, entity, permission, arguments, functions, base.ExpandTreeNode_OPERATION_INTERSECTION)
 }
 
 // expandExclusion is a helper function that executes multiple ExpandFunctions in parallel and returns an ExpandResponse
@@ -861,14 +1115,14 @@ func expandIntersection(
 //
 // Returns:
 //   - ExpandResponse containing the expanded user sets from the exclusion operation, or an error if any of the ExpandFunctions failed
-func expandExclusion(
+func (engine *ExpandEngine) expandExclusion(
 	ctx context.Context,
 	entity *base.Entity,
 	permission string,
 	arguments []*base.Argument,
 	functions []ExpandFunction,
 ) ExpandResponse {
-	return expandOperation(ctx, entity, permission, arguments, functions, base.ExpandTreeNode_OPERATION_EXCLUSION)
+	return engine.expandOperation(ctx, entity, permission, arguments, functions, base.ExpandTreeNode_OPERATION_EXCLUSION)
 }
 
 // expandFail is a helper function that returns an ExpandFunction that immediately sends an ExpandResponse with the specified error

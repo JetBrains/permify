@@ -447,7 +447,10 @@ func serve() func(cmd *cobra.Command, args []string) error {
 			engines.CheckConcurrencyLimit(cfg.Service.Permission.ConcurrencyLimit),
 			engines.CheckMaxBatchSize(cfg.Service.Permission.BulkLimit),
 		)
-		expandEngine := engines.NewExpandEngine(schemaReader, dataReader)
+		expandEngine := engines.NewExpandEngine(schemaReader, dataReader,
+			engines.ExpandConcurrencyLimit(cfg.Service.Permission.ConcurrencyLimit),
+			engines.ExpandMaxBatchSize(cfg.Service.Permission.BulkLimit),
+		)
 
 		// Declare a variable `checker` of type `invoke.Check`.
 		var checker invoke.Check
