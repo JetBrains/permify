@@ -114,6 +114,7 @@ func (c *Balancer) Check(ctx context.Context, request *invoke.BatchCheckRequest)
 	// Get the current picker; fall back to local if not ready.
 	nodePicker := c.builder.Picker()
 	if nodePicker == nil {
+		slog.ErrorContext(ctx, "Pick failed, falling back to local", "error", "picker not ready")
 		return c.checker.Check(ctx, request)
 	}
 
