@@ -61,6 +61,27 @@ var _ = Describe("Builder", func() {
 		})
 	})
 
+	Describe("Picker", func() {
+		It("should return a nil interface before the balancer is built", func() {
+			Expect(builder.Picker() == nil).To(BeTrue())
+		})
+
+		It("should return a nil interface while the picker is unavailable", func() {
+			builder.Build(nil, balancer.BuildOptions{})
+			Expect(builder.Picker() == nil).To(BeTrue())
+		})
+
+		It("should return a nil interface when the picker becomes unavailable", func() {
+			bal := builder.Build(nil, balancer.BuildOptions{}).(*Balancer)
+			p := &picker{}
+			bal.picker.Store(p)
+			Expect(builder.Picker()).To(BeIdenticalTo(p))
+
+			bal.picker.Store(nil)
+			Expect(builder.Picker() == nil).To(BeTrue())
+		})
+	})
+
 	Describe("ParseConfig", func() {
 		It("should parse valid JSON configuration", func() {
 			jsonConfig := `{"partitionCount": 100, "replicationFactor": 3, "load": 1.25, "pickerWidth": 2}`
