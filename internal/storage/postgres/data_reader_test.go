@@ -332,6 +332,126 @@ var _ = Describe("DataReader", func() {
 		})
 	})
 
+	Context("Multiple IDs Filters", func() {
+		It("should query and delete data filtered by multiple entity IDs, subject IDs and attributes", func() {
+			ctx := context.Background()
+
+			tup1, err := tuple.Tuple("organization:organization-1#admin@user:user-1")
+			Expect(err).ShouldNot(HaveOccurred())
+			tup2, err := tuple.Tuple("organization:organization-2#admin@user:user-1")
+			Expect(err).ShouldNot(HaveOccurred())
+			tup3, err := tuple.Tuple("organization:organization-1#admin@user:user-2")
+			Expect(err).ShouldNot(HaveOccurred())
+			tup4, err := tuple.Tuple("organization:organization-3#admin@user:user-3")
+			Expect(err).ShouldNot(HaveOccurred())
+
+			attr1, err := attribute.Attribute("organization:organization-1$public|boolean:true")
+			Expect(err).ShouldNot(HaveOccurred())
+			attr2, err := attribute.Attribute("organization:organization-2$public|boolean:false")
+			Expect(err).ShouldNot(HaveOccurred())
+			attr3, err := attribute.Attribute("organization:organization-3$public|boolean:true")
+			Expect(err).ShouldNot(HaveOccurred())
+			attr4, err := attribute.Attribute("organization:organization-1$balance|integer:3000")
+			Expect(err).ShouldNot(HaveOccurred())
+
+			token1, err := dataWriter.Write(ctx, "t1",
+				database.NewTupleCollection(tup1, tup2, tup3, tup4),
+				database.NewAttributeCollection(attr1, attr2, attr3, attr4),
+			)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			queryTuples := func(filter *base.TupleFilter, snap string) []string {
+				it, err := dataReader.QueryRelationships(ctx, "t1", filter, snap, database.NewCursorPagination())
+				Expect(err).ShouldNot(HaveOccurred())
+				var result []string
+				for it.HasNext() {
+					result = append(result, tuple.ToString(it.GetNext()))
+				}
+				return result
+			}
+
+			queryAttributes := func(filter *base.AttributeFilter, snap string) []string {
+				it, err := dataReader.QueryAttributes(ctx, "t1", filter, snap, database.NewCursorPagination())
+				Expect(err).ShouldNot(HaveOccurred())
+				var result []string
+				for it.HasNext() {
+					a := it.GetNext()
+					result = append(result, a.GetEntity().GetId()+"$"+a.GetAttribute())
+				}
+				return result
+			}
+
+			Expect(queryTuples(&base.TupleFilter{
+				Entity: &base.EntityFilter{
+					Type: "organization",
+					Ids:  []string{"organization-1", "organization-2"},
+				},
+			}, token1.String())).Should(ConsistOf(tuple.ToString(tup1), tuple.ToString(tup2), tuple.ToString(tup3)))
+
+			Expect(queryTuples(&base.TupleFilter{
+				Entity: &base.EntityFilter{
+					Type: "organization",
+					Ids:  []string{"organization-1", "organization-2", "organization-3"},
+				},
+				Subject: &base.SubjectFilter{
+					Type: "user",
+					Ids:  []string{"user-1", "user-3"},
+				},
+			}, token1.String())).Should(ConsistOf(tuple.ToString(tup1), tuple.ToString(tup2), tuple.ToString(tup4)))
+
+			Expect(queryAttributes(&base.AttributeFilter{
+				Entity: &base.EntityFilter{
+					Type: "organization",
+					Ids:  []string{"organization-1", "organization-3"},
+				},
+				Attributes: []string{"public"},
+			}, token1.String())).Should(ConsistOf("organization-1$public", "organization-3$public"))
+
+			Expect(queryAttributes(&base.AttributeFilter{
+				Entity: &base.EntityFilter{
+					Type: "organization",
+					Ids:  []string{"organization-1", "organization-2"},
+				},
+				Attributes: []string{"public", "balance"},
+			}, token1.String())).Should(ConsistOf("organization-1$public", "organization-2$public", "organization-1$balance"))
+
+			token2, err := dataWriter.Delete(ctx, "t1",
+				&base.TupleFilter{
+					Entity: &base.EntityFilter{
+						Type: "organization",
+						Ids:  []string{"organization-1", "organization-3"},
+					},
+					Subject: &base.SubjectFilter{
+						Type: "user",
+						Ids:  []string{"user-1", "user-3"},
+					},
+				},
+				&base.AttributeFilter{
+					Entity: &base.EntityFilter{
+						Type: "organization",
+						Ids:  []string{"organization-2", "organization-3"},
+					},
+					Attributes: []string{"public", "balance"},
+				},
+			)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			Expect(queryTuples(&base.TupleFilter{
+				Entity: &base.EntityFilter{
+					Type: "organization",
+					Ids:  []string{"organization-1", "organization-2", "organization-3"},
+				},
+			}, token2.String())).Should(ConsistOf(tuple.ToString(tup2), tuple.ToString(tup3)))
+
+			Expect(queryAttributes(&base.AttributeFilter{
+				Entity: &base.EntityFilter{
+					Type: "organization",
+					Ids:  []string{"organization-1", "organization-2", "organization-3"},
+				},
+			}, token2.String())).Should(ConsistOf("organization-1$public", "organization-1$balance"))
+		})
+	})
+
 	Context("Read Attributes", func() {
 		It("should write attributes and read attributes correctly", func() {
 			ctx := context.Background()
