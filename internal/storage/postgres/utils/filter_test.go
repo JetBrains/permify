@@ -1,6 +1,8 @@
 package utils_test
 
 import (
+	"fmt"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -30,8 +32,8 @@ var _ = Describe("Filter", func() {
 
 			sl = utils.TuplesFilterQueryForSelectBuilder(sl, filter)
 
-			expectedSql := "SELECT * FROM relation_tuples WHERE entity_id IN (?,?) AND entity_type = ? AND relation = ? AND subject_id IN (?,?) AND subject_relation = ? AND subject_type = ?"
-			expectedArgs := []interface{}{"1", "2", "entity_type", "relation", "3", "4", "subject_relation", "subject_type"}
+			expectedSql := "SELECT * FROM relation_tuples WHERE entity_id = ANY(?) AND subject_id = ANY(?) AND entity_type = ? AND relation = ? AND subject_relation = ? AND subject_type = ?"
+			expectedArgs := []interface{}{[]string{"1", "2"}, []string{"3", "4"}, "entity_type", "relation", "subject_relation", "subject_type"}
 
 			sql, args, err := sl.ToSql()
 			Expect(err).ShouldNot(HaveOccurred())
@@ -57,8 +59,8 @@ var _ = Describe("Filter", func() {
 
 			sl = utils.TuplesFilterQueryForSelectBuilder(sl, filter)
 
-			expectedSql := "SELECT * FROM relation_tuples WHERE entity_id IN (?,?) AND entity_type = ? AND subject_id IN (?,?) AND subject_type = ?"
-			expectedArgs := []interface{}{"1", "2", "entity_type", "3", "4", "subject_type"}
+			expectedSql := "SELECT * FROM relation_tuples WHERE entity_id = ANY(?) AND subject_id = ANY(?) AND entity_type = ? AND subject_type = ?"
+			expectedArgs := []interface{}{[]string{"1", "2"}, []string{"3", "4"}, "entity_type", "subject_type"}
 
 			sql, args, err := sl.ToSql()
 			Expect(err).ShouldNot(HaveOccurred())
@@ -176,11 +178,13 @@ var _ = Describe("Filter", func() {
 
 			sl = utils.TuplesFilterQueryForUpdateBuilder(sl, filter)
 
-			expectedSql := "UPDATE relation_tuples SET expired_tx_id = ? WHERE entity_id IN (?,?) AND entity_type = ? AND relation = ? AND subject_id IN (?,?) AND subject_type = ?"
+			expectedSql := "UPDATE relation_tuples SET expired_tx_id = ? WHERE entity_id = ANY(?) AND subject_id = ANY(?) AND entity_type = ? AND relation = ? AND subject_type = ?"
+			expectedArgs := []interface{}{1000, []string{"1", "2"}, []string{"4", "8"}, "organization", "admin", "user"}
 
-			sql, _, err := sl.ToSql()
+			sql, args, err := sl.ToSql()
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(sql).Should(Equal(expectedSql))
+			Expect(args).Should(Equal(expectedArgs))
 		})
 	})
 
@@ -227,11 +231,43 @@ var _ = Describe("Filter", func() {
 
 			sl = utils.AttributesFilterQueryForUpdateBuilder(sl, filter)
 
-			expectedSql := "UPDATE attributes SET expired_tx_id = ? WHERE attribute IN (?,?) AND entity_id IN (?,?) AND entity_type = ?"
+			expectedSql := "UPDATE attributes SET expired_tx_id = ? WHERE entity_id = ANY(?) AND attribute = ANY(?) AND entity_type = ?"
+			expectedArgs := []interface{}{1000, []string{"1", "2"}, []string{"public", "balance"}, "organization"}
 
-			sql, _, err := sl.ToSql()
+			sql, args, err := sl.ToSql()
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(sql).Should(Equal(expectedSql))
+			Expect(args).Should(Equal(expectedArgs))
+		})
+	})
+
+	Context("Array parameters", func() {
+		It("should generate the same SQL regardless of the number of IDs", func() {
+			build := func(n int) (string, []interface{}) {
+				ids := make([]string, n)
+				for i := range ids {
+					ids[i] = fmt.Sprintf("%d", i)
+				}
+				sl := utils.AttributesFilterQueryForSelectBuilder(
+					squirrel.Select("*").From("attributes").PlaceholderFormat(squirrel.Dollar),
+					&base.AttributeFilter{
+						Entity:     &base.EntityFilter{Type: "organization", Ids: ids},
+						Attributes: []string{"public"},
+					},
+				)
+				sql, args, err := sl.ToSql()
+				Expect(err).ShouldNot(HaveOccurred())
+				return sql, args
+			}
+
+			sql2, args2 := build(2)
+			sql1000, args1000 := build(1000)
+
+			Expect(sql2).Should(Equal("SELECT * FROM attributes WHERE entity_id = ANY($1) AND attribute = $2 AND entity_type = $3"))
+			Expect(sql1000).Should(Equal(sql2))
+			Expect(args2).Should(HaveLen(3))
+			Expect(args1000).Should(HaveLen(3))
+			Expect(args1000[0]).Should(HaveLen(1000))
 		})
 	})
 

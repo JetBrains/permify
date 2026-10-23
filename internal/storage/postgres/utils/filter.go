@@ -7,6 +7,13 @@ import (
 	"github.com/Permify/permify/pkg/tuple"
 )
 
+// anyOf builds a "column = ANY(?)" condition that passes all values as a single array parameter,
+// so the SQL text does not depend on the number of values (unlike squirrel.Eq with a slice -> IN (?,?,...)).
+func anyOf(column string, values []string) squirrel.Sqlizer {
+	// column — it is a literal from our code, it is an SQL-injection-free code
+	return squirrel.Expr(column+" = ANY(?)", values)
+}
+
 // TuplesFilterQueryForSelectBuilder -
 func TuplesFilterQueryForSelectBuilder(sl squirrel.SelectBuilder, filter *base.TupleFilter) squirrel.SelectBuilder {
 	eq := squirrel.Eq{}
@@ -21,8 +28,8 @@ func TuplesFilterQueryForSelectBuilder(sl squirrel.SelectBuilder, filter *base.T
 			// If there is only one ID, use the = operator
 			eq["entity_id"] = entityIds[0]
 		} else {
-			// If there are multiple IDs, use the IN operator
-			eq["entity_id"] = entityIds
+			// If there are multiple IDs, use = ANY with a single array parameter
+			sl = sl.Where(anyOf("entity_id", entityIds))
 		}
 	}
 
@@ -40,8 +47,8 @@ func TuplesFilterQueryForSelectBuilder(sl squirrel.SelectBuilder, filter *base.T
 			// If there is only one ID, use the = operator
 			eq["subject_id"] = subjectIds[0]
 		} else {
-			// If there are multiple IDs, use the IN operator
-			eq["subject_id"] = subjectIds
+			// If there are multiple IDs, use = ANY with a single array parameter
+			sl = sl.Where(anyOf("subject_id", subjectIds))
 		}
 	}
 
@@ -49,8 +56,8 @@ func TuplesFilterQueryForSelectBuilder(sl squirrel.SelectBuilder, filter *base.T
 		eq["subject_relation"] = filter.GetSubject().GetRelation()
 	}
 
-	// If eq is empty, return the original squirrel.SelectBuilder without attaching a WHERE clause.
-	// This ensures we don't accidentally select every row in the table.
+	// If eq is empty, return the squirrel.SelectBuilder without attaching an empty WHERE clause
+	// (it may already contain = ANY conditions). This ensures we don't accidentally select every row in the table.
 	if len(eq) == 0 {
 		return sl
 	}
@@ -72,8 +79,8 @@ func AttributesFilterQueryForSelectBuilder(sl squirrel.SelectBuilder, filter *ba
 			// If there is only one ID, use the = operator
 			eq["entity_id"] = entityIds[0]
 		} else {
-			// If there are multiple IDs, use the IN operator
-			eq["entity_id"] = entityIds
+			// If there are multiple IDs, use = ANY with a single array parameter
+			sl = sl.Where(anyOf("entity_id", entityIds))
 		}
 	}
 
@@ -83,13 +90,13 @@ func AttributesFilterQueryForSelectBuilder(sl squirrel.SelectBuilder, filter *ba
 			// If there is only one attribute, use the = operator
 			eq["attribute"] = attributes[0]
 		} else {
-			// If there are multiple attributes, use the IN operator
-			eq["attribute"] = attributes
+			// If there are multiple attributes, use = ANY with a single array parameter
+			sl = sl.Where(anyOf("attribute", attributes))
 		}
 	}
 
-	// If eq is empty, return the original squirrel.SelectBuilder without attaching a WHERE clause.
-	// This ensures we don't accidentally select every row in the table.
+	// If eq is empty, return the squirrel.SelectBuilder without attaching an empty WHERE clause
+	// (it may already contain = ANY conditions). This ensures we don't accidentally select every row in the table.
 	if len(eq) == 0 {
 		return sl
 	}
@@ -111,8 +118,8 @@ func TuplesFilterQueryForUpdateBuilder(sl squirrel.UpdateBuilder, filter *base.T
 			// If there is only one ID, use the = operator
 			eq["entity_id"] = entityIds[0]
 		} else {
-			// If there are multiple IDs, use the IN operator
-			eq["entity_id"] = entityIds
+			// If there are multiple IDs, use = ANY with a single array parameter
+			sl = sl.Where(anyOf("entity_id", entityIds))
 		}
 	}
 
@@ -130,8 +137,8 @@ func TuplesFilterQueryForUpdateBuilder(sl squirrel.UpdateBuilder, filter *base.T
 			// If there is only one ID, use the = operator
 			eq["subject_id"] = subjectIds[0]
 		} else {
-			// If there are multiple IDs, use the IN operator
-			eq["subject_id"] = subjectIds
+			// If there are multiple IDs, use = ANY with a single array parameter
+			sl = sl.Where(anyOf("subject_id", subjectIds))
 		}
 	}
 
@@ -139,8 +146,8 @@ func TuplesFilterQueryForUpdateBuilder(sl squirrel.UpdateBuilder, filter *base.T
 		eq["subject_relation"] = filter.GetSubject().GetRelation()
 	}
 
-	// If eq is empty, return the original squirrel.UpdateBuilder without attaching a WHERE clause.
-	// This ensures we don't accidentally update every row in the table.
+	// If eq is empty, return the squirrel.UpdateBuilder without attaching an empty WHERE clause
+	// (it may already contain = ANY conditions). This ensures we don't accidentally update every row in the table.
 	if len(eq) == 0 {
 		return sl
 	}
@@ -201,8 +208,8 @@ func AttributesFilterQueryForUpdateBuilder(sl squirrel.UpdateBuilder, filter *ba
 			// If there is only one ID, use the = operator
 			eq["entity_id"] = entityIds[0]
 		} else {
-			// If there are multiple IDs, use the IN operator
-			eq["entity_id"] = entityIds
+			// If there are multiple IDs, use = ANY with a single array parameter
+			sl = sl.Where(anyOf("entity_id", entityIds))
 		}
 	}
 
@@ -212,13 +219,13 @@ func AttributesFilterQueryForUpdateBuilder(sl squirrel.UpdateBuilder, filter *ba
 			// If there is only one attribute, use the = operator
 			eq["attribute"] = attributes[0]
 		} else {
-			// If there are multiple attributes, use the IN operator
-			eq["attribute"] = attributes
+			// If there are multiple attributes, use = ANY with a single array parameter
+			sl = sl.Where(anyOf("attribute", attributes))
 		}
 	}
 
-	// If eq is empty, return the original squirrel.UpdateBuilder without attaching a WHERE clause.
-	// This ensures we don't accidentally update every row in the table.
+	// If eq is empty, return the squirrel.UpdateBuilder without attaching an empty WHERE clause
+	// (it may already contain = ANY conditions). This ensures we don't accidentally update every row in the table.
 	if len(eq) == 0 {
 		return sl
 	}
