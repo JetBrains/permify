@@ -38,6 +38,11 @@ linters:
       - linters:
           - staticcheck
         path: "pkg/telemetry/tracerexporters/jaeger.go"
+      # zipkin exporter deprecated - migrate to OTLP
+      - linters:
+          - staticcheck
+        path: "pkg/telemetry/tracerexporters/zipkin.go"
+        text: "SA1019"
     paths:
       - "docs$"
       - "integration-test$"
