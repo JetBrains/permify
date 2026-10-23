@@ -57,6 +57,10 @@ lint-all: linter-golangci linter-hadolint ## Run all linters
 security-scan: ## Scan code for security vulnerabilities using Gosec
 	go tool gosec -exclude=G115,G103 -exclude-dir=sdk -exclude-dir=playground -exclude-dir=docs -exclude-dir=assets -exclude-dir=pkg/pb ./...
 
+.PHONY: vulncheck
+vulncheck: ## Scan Go dependencies and stdlib for reachable vulnerabilities using govulncheck
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./cmd/... ./internal/... ./pkg/...
+
 .PHONY: trivy-scan
 trivy-scan: ## Scan Docker image for vulnerabilities using Trivy
 	docker build -t permify-image .

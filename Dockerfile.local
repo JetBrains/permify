@@ -1,13 +1,13 @@
 # Use the correct Go version
-FROM golang:1.25.7-alpine@sha256:f6751d823c26342f9506c03797d2527668d095b0a15f1862cddb4d927a7a4ced
+FROM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba
 
 RUN apk --no-cache add curl git
 
 # Build grpc-health-probe
 WORKDIR /tmp
-RUN git clone https://github.com/grpc-ecosystem/grpc-health-probe.git && \
+RUN git clone --depth 1 --branch v0.4.60 https://github.com/grpc-ecosystem/grpc-health-probe.git && \
     cd grpc-health-probe && \
-    CGO_ENABLED=0 go install -a -tags netgo -ldflags=-w && \
+    GOTOOLCHAIN=local CGO_ENABLED=0 go install -a -tags netgo -ldflags=-w && \
     cp /go/bin/grpc-health-probe /usr/local/bin/grpc_health_probe && \
     cd / && rm -rf /tmp/grpc-health-probe
 
