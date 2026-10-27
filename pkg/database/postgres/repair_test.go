@@ -303,8 +303,8 @@ func createTestDatabase() (*Postgres, testcontainers.Container, error) {
 	db, err := New(postgresDSN,
 		MaxOpenConnections(20),
 		MaxIdleConnections(1),
-		MaxConnectionIdleTime(60),
-		MaxConnectionLifeTime(300),
+		MaxConnectionIdleTime(60*time.Second),
+		MaxConnectionLifeTime(300*time.Second),
 	)
 	if err != nil {
 		container.Terminate(ctx)
@@ -381,8 +381,8 @@ func createTestDatabaseWithMigrations() (*Postgres, testcontainers.Container, er
 	db, err := New(postgresDSN,
 		MaxOpenConnections(20),
 		MaxIdleConnections(1),
-		MaxConnectionIdleTime(60),
-		MaxConnectionLifeTime(300),
+		MaxConnectionIdleTime(60*time.Second),
+		MaxConnectionLifeTime(300*time.Second),
 	)
 	if err != nil {
 		container.Terminate(ctx)

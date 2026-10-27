@@ -66,8 +66,8 @@ func PostgresDB(postgresVersion string) database.Database {
 		AutoMigrate:           true,
 		MaxOpenConnections:    20,
 		MaxIdleConnections:    1,
-		MaxConnectionLifetime: 300,
-		MaxConnectionIdleTime: 60,
+		MaxConnectionLifetime: 300 * time.Second,
+		MaxConnectionIdleTime: 60 * time.Second,
 	}
 
 	err = storage.Migrate(cfg)
