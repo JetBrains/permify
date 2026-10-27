@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/cespare/xxhash/v2"
@@ -25,7 +26,27 @@ type CheckEngineWithCache struct {
 	cache        cache.Cache
 
 	// Metrics
-	cacheHitHistogram metric.Int64Histogram
+	cacheLookupsCounter metric.Int64Counter
+}
+
+// Attribute sets of the permission cache lookups counter. They are created once, because Check is on the hot path.
+var (
+	cacheHitAttrs  = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "hit")))
+	cacheMissAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "miss")))
+)
+
+// CheckEngineWithCacheOption - Option type for CheckEngineWithCache
+type CheckEngineWithCacheOption func(*checkEngineWithCacheOptions)
+
+type checkEngineWithCacheOptions struct {
+	meter metric.Meter
+}
+
+// WithMeter - Sets the meter used to create the cache metrics. The default is internal.Meter.
+func WithMeter(meter metric.Meter) CheckEngineWithCacheOption {
+	return func(o *checkEngineWithCacheOptions) {
+		o.meter = meter
+	}
 }
 
 // NewCheckEngineWithCache creates a new instance of EngineKeyManager by initializing an EngineKeys
@@ -34,12 +55,18 @@ func NewCheckEngineWithCache(
 	checker invoke.Check,
 	schemaReader storage.SchemaReader,
 	cache cache.Cache,
+	opts ...CheckEngineWithCacheOption,
 ) invoke.Check {
+	o := &checkEngineWithCacheOptions{meter: internal.Meter}
+	for _, opt := range opts {
+		opt(o)
+	}
+
 	return &CheckEngineWithCache{
-		schemaReader:      schemaReader,
-		checker:           checker,
-		cache:             cache,
-		cacheHitHistogram: telemetry.NewHistogram(internal.Meter, "cache_hit", "amount", "Number of cache hits"),
+		schemaReader:        schemaReader,
+		checker:             checker,
+		cache:               cache,
+		cacheLookupsCounter: telemetry.NewCounter(o.meter, "permission_cache_lookups", "Number of permission cache lookups per entity ID, by result (hit or miss)"),
 	}
 }
 
@@ -64,10 +91,11 @@ func (c *CheckEngineWithCache) Check(ctx context.Context, request *invoke.BatchC
 		singleReq := request.ToPermissionCheckRequest(id)
 		res, found := c.getCheckKey(singleReq, isRelational)
 		if found {
-			c.cacheHitHistogram.Record(ctx, 1)
+			c.cacheLookupsCounter.Add(ctx, 1, cacheHitAttrs)
 			cachedResults[id] = res.GetCan()
 			continue
 		}
+		c.cacheLookupsCounter.Add(ctx, 1, cacheMissAttrs)
 		uncachedIDs = append(uncachedIDs, id)
 	}
 
@@ -170,7 +198,7 @@ func (c *CheckEngineWithCache) setCheckKey(key *base.PermissionCheckRequest, val
 	// Compute the hash sum and encode it as a hexadecimal string.
 	k := hex.EncodeToString(h.Sum(nil))
 
-	// Set the hashed key and the check result in the cache, using the size of the hashed key as an expiry.
+	// Set the hashed key and the check result in the cache, using the size of the hashed key as the cost.
 	// The Set method should return true if the operation was successful, so return the result.
 	return c.cache.Set(k, value.GetCan(), int64(size))
 }

@@ -6,23 +6,68 @@ import (
 	"fmt"
 	"reflect"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+
+	"github.com/Permify/permify/internal"
 	"github.com/Permify/permify/internal/storage"
 	"github.com/Permify/permify/pkg/cache"
 	"github.com/Permify/permify/pkg/database"
 	base "github.com/Permify/permify/pkg/pb/base/v1"
+	"github.com/Permify/permify/pkg/telemetry"
 )
+
+// Attribute sets of the schema cache lookups counter. They are created once, because the lookups are on the hot path.
+var (
+	entityHitAttrs    = schemaCacheLookupAttrs("entity", "hit")
+	entityMissAttrs   = schemaCacheLookupAttrs("entity", "miss")
+	entityBypassAttrs = schemaCacheLookupAttrs("entity", "bypass")
+	ruleHitAttrs      = schemaCacheLookupAttrs("rule", "hit")
+	ruleMissAttrs     = schemaCacheLookupAttrs("rule", "miss")
+	ruleBypassAttrs   = schemaCacheLookupAttrs("rule", "bypass")
+)
+
+func schemaCacheLookupAttrs(kind, result string) metric.MeasurementOption {
+	return metric.WithAttributeSet(attribute.NewSet(
+		attribute.String("kind", kind),
+		attribute.String("result", result),
+	))
+}
 
 // SchemaReader - Add cache behaviour to schema reader
 type SchemaReader struct {
 	delegate storage.SchemaReader
 	cache    cache.Cache
+
+	// Metrics
+	cacheLookupsCounter metric.Int64Counter
+}
+
+// SchemaReaderOption - Option type for SchemaReader
+type SchemaReaderOption func(*schemaReaderOptions)
+
+type schemaReaderOptions struct {
+	meter metric.Meter
+}
+
+// WithMeter - Sets the meter used to create the schema cache metrics. The default is internal.Meter.
+func WithMeter(meter metric.Meter) SchemaReaderOption {
+	return func(o *schemaReaderOptions) {
+		o.meter = meter
+	}
 }
 
 // NewSchemaReader new instance of SchemaReader
-func NewSchemaReader(delegate storage.SchemaReader, cache cache.Cache) *SchemaReader {
+func NewSchemaReader(delegate storage.SchemaReader, cache cache.Cache, opts ...SchemaReaderOption) *SchemaReader {
+	o := &schemaReaderOptions{meter: internal.Meter}
+	for _, opt := range opts {
+		opt(o)
+	}
+
 	return &SchemaReader{
-		delegate: delegate,
-		cache:    cache,
+		delegate:            delegate,
+		cache:               cache,
+		cacheLookupsCounter: telemetry.NewCounter(o.meter, "schema_cache_lookups", "Number of schema cache lookups, by kind (entity or rule) and result (hit, miss or bypass when no schema version is given)"),
 	}
 }
 
@@ -42,6 +87,13 @@ func (r *SchemaReader) ReadEntityDefinition(ctx context.Context, tenantID, share
 	found := false
 	if version != "" {
 		s, found = r.cache.Get(schemaCacheKey(tenantID, sharedSchemaID, entityName, version))
+		if found {
+			r.cacheLookupsCounter.Add(ctx, 1, entityHitAttrs)
+		} else {
+			r.cacheLookupsCounter.Add(ctx, 1, entityMissAttrs)
+		}
+	} else {
+		r.cacheLookupsCounter.Add(ctx, 1, entityBypassAttrs)
 	}
 	if !found {
 		definition, version, err = r.delegate.ReadEntityDefinition(ctx, tenantID, sharedSchemaID, entityName, version)
@@ -65,6 +117,13 @@ func (r *SchemaReader) ReadRuleDefinition(ctx context.Context, tenantID, sharedS
 	found := false
 	if version != "" {
 		s, found = r.cache.Get(schemaCacheKey(tenantID, sharedSchemaID, ruleName, version))
+		if found {
+			r.cacheLookupsCounter.Add(ctx, 1, ruleHitAttrs)
+		} else {
+			r.cacheLookupsCounter.Add(ctx, 1, ruleMissAttrs)
+		}
+	} else {
+		r.cacheLookupsCounter.Add(ctx, 1, ruleBypassAttrs)
 	}
 	if !found {
 		definition, version, err = r.delegate.ReadRuleDefinition(ctx, tenantID, sharedSchemaID, ruleName, version)
