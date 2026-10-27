@@ -2,6 +2,7 @@ package invoke
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -68,10 +69,37 @@ type DirectInvoker struct {
 	// LookupSubject
 	sp SubjectPermission
 
-	checkHistogram             metric.Int64Histogram
-	lookupEntityHistogram      metric.Int64Histogram
-	lookupSubjectHistogram     metric.Int64Histogram
-	subjectPermissionHistogram metric.Int64Histogram
+	checkCounter             metric.Int64Counter
+	lookupEntityCounter      metric.Int64Counter
+	lookupSubjectCounter     metric.Int64Counter
+	subjectPermissionCounter metric.Int64Counter
+
+	subjectTypeAttrs      sync.Map
+	subjectTypeAttrsMu    sync.Mutex
+	subjectTypeAttrsCount atomic.Int32
+}
+
+const (
+	maxCachedSubjectTypes = 256
+	otherSubjectType      = "__other__"
+)
+
+var otherSubjectTypeAttrs = metric.WithAttributeSet(attribute.NewSet(
+	attribute.String("subject_type", otherSubjectType),
+))
+
+// DirectInvokerOption - Option type for DirectInvoker
+type DirectInvokerOption func(*directInvokerOptions)
+
+type directInvokerOptions struct {
+	meter metric.Meter
+}
+
+// WithMeter - Sets the meter used to create the DirectInvoker metrics. The default is internal.Meter.
+func WithMeter(meter metric.Meter) DirectInvokerOption {
+	return func(o *directInvokerOptions) {
+		o.meter = meter
+	}
 }
 
 // NewDirectInvoker is a constructor for DirectInvoker.
@@ -84,20 +112,53 @@ func NewDirectInvoker(
 	ec Expand,
 	lo Lookup,
 	sp SubjectPermission,
+	opts ...DirectInvokerOption,
 ) *DirectInvoker {
-	return &DirectInvoker{
-		schemaReader:   schemaReader,
-		dataReader:     dataReader,
-		cc:             cc,
-		ec:             ec,
-		lo:             lo,
-		sp:             sp,
-		checkHistogram: telemetry.NewHistogram(internal.Meter, "check", "amount", "Number of checks"),
-
-		lookupEntityHistogram:      telemetry.NewHistogram(internal.Meter, "lookup_entity", "amount", "Number of lookup entity"),
-		lookupSubjectHistogram:     telemetry.NewHistogram(internal.Meter, "lookup_subject", "amount", "Number of lookup subject"),
-		subjectPermissionHistogram: telemetry.NewHistogram(internal.Meter, "subject_permission", "amount", "Number of subject permission"),
+	o := &directInvokerOptions{meter: internal.Meter}
+	for _, opt := range opts {
+		opt(o)
 	}
+
+	return &DirectInvoker{
+		schemaReader: schemaReader,
+		dataReader:   dataReader,
+		cc:           cc,
+		ec:           ec,
+		lo:           lo,
+		sp:           sp,
+		checkCounter: telemetry.NewCounter(o.meter, "check", "Number of DirectInvoker.Check calls, including nested checks and failed checks"),
+
+		lookupEntityCounter:      telemetry.NewCounter(o.meter, "lookup_entity", "Number of lookup entity calls (unary and stream), including engine errors"),
+		lookupSubjectCounter:     telemetry.NewCounter(o.meter, "lookup_subject", "Number of lookup subject calls, including engine errors"),
+		subjectPermissionCounter: telemetry.NewCounter(o.meter, "subject_permission", "Number of subject permission calls, including engine errors"),
+	}
+}
+
+// checkSubjectTypeAttrs returns a cached MeasurementOption for the given subject_type
+// so Check does not allocate an attribute.Set on every call. Once the cache is full,
+// unrecognized subject types share a bounded-cardinality "__other__" series.
+func (invoker *DirectInvoker) checkSubjectTypeAttrs(subjectType string) metric.MeasurementOption {
+	if opt, ok := invoker.subjectTypeAttrs.Load(subjectType); ok {
+		return opt.(metric.MeasurementOption)
+	}
+	if subjectType == otherSubjectType || invoker.subjectTypeAttrsCount.Load() >= maxCachedSubjectTypes {
+		return otherSubjectTypeAttrs
+	}
+
+	invoker.subjectTypeAttrsMu.Lock()
+	defer invoker.subjectTypeAttrsMu.Unlock()
+
+	if opt, ok := invoker.subjectTypeAttrs.Load(subjectType); ok {
+		return opt.(metric.MeasurementOption)
+	}
+	if invoker.subjectTypeAttrsCount.Load() >= maxCachedSubjectTypes {
+		return otherSubjectTypeAttrs
+	}
+
+	opt := metric.WithAttributeSet(attribute.NewSet(attribute.String("subject_type", subjectType)))
+	invoker.subjectTypeAttrs.Store(subjectType, opt)
+	invoker.subjectTypeAttrsCount.Add(1)
+	return opt
 }
 
 // Check is a method that implements the Check interface.
@@ -112,13 +173,8 @@ func (invoker *DirectInvoker) Check(ctx context.Context, request *BatchCheckRequ
 		attribute.KeyValue{Key: "subject", Value: attribute.StringValue(tuple.SubjectToString(request.Subject))},
 	))
 	defer span.End()
-	invoker.checkHistogram.Record(ctx, 1,
-		metric.WithAttributeSet(
-			attribute.NewSet(
-				attribute.KeyValue{Key: "subject_id", Value: attribute.StringValue(request.Subject.GetId())},
-				attribute.KeyValue{Key: "subject_type", Value: attribute.StringValue(request.Subject.GetType())},
-			)),
-	)
+	// Only low-cardinality attributes are recorded here. Use the span for the subject id.
+	invoker.checkCounter.Add(ctx, 1, invoker.checkSubjectTypeAttrs(request.Subject.GetType()))
 
 	denied := NewBatchCheckResponse(base.CheckResult_CHECK_RESULT_DENIED, request.EntityIDs...)
 
@@ -243,7 +299,7 @@ func (invoker *DirectInvoker) LookupEntity(ctx context.Context, request *base.Pe
 
 	resp, err := invoker.lo.LookupEntity(ctx, request)
 
-	invoker.lookupEntityHistogram.Record(ctx, 1)
+	invoker.lookupEntityCounter.Add(ctx, 1)
 
 	return resp, err
 }
@@ -284,7 +340,7 @@ func (invoker *DirectInvoker) LookupEntityStream(ctx context.Context, request *b
 
 	resp := invoker.lo.LookupEntityStream(ctx, request, server)
 
-	invoker.lookupEntityHistogram.Record(ctx, 1)
+	invoker.lookupEntityCounter.Add(ctx, 1)
 
 	return resp
 }
@@ -330,7 +386,7 @@ func (invoker *DirectInvoker) LookupSubject(ctx context.Context, request *base.P
 
 	resp, err := invoker.lo.LookupSubject(ctx, request)
 
-	invoker.lookupSubjectHistogram.Record(ctx, 1)
+	invoker.lookupSubjectCounter.Add(ctx, 1)
 
 	// Call the LookupSubject function of the ls field in the invoker, pass the context and request,
 	// and return its response and error
@@ -376,7 +432,7 @@ func (invoker *DirectInvoker) SubjectPermission(ctx context.Context, request *ba
 	}
 	resp, err := invoker.sp.SubjectPermission(ctx, request)
 
-	invoker.subjectPermissionHistogram.Record(ctx, 1)
+	invoker.subjectPermissionCounter.Add(ctx, 1)
 
 	// Call the SubjectPermission function of the ls field in the invoker, pass the context and request,
 	// and return its response and error

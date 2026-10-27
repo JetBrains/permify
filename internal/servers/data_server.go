@@ -22,17 +22,17 @@ import (
 type DataServer struct {
 	v1.UnimplementedDataServer
 
-	sr                           storage.SchemaReader
-	dr                           storage.DataReader
-	br                           storage.BundleReader
-	dw                           storage.DataWriter
-	writeDataHistogram           api.Int64Histogram
-	deleteDataHistogram          api.Int64Histogram
-	readAttributesHistogram      api.Int64Histogram
-	readRelationshipsHistogram   api.Int64Histogram
-	writeRelationshipsHistogram  api.Int64Histogram
-	deleteRelationshipsHistogram api.Int64Histogram
-	runBundleHistogram           api.Int64Histogram
+	sr                         storage.SchemaReader
+	dr                         storage.DataReader
+	br                         storage.BundleReader
+	dw                         storage.DataWriter
+	writeDataCounter           api.Int64Counter
+	deleteDataCounter          api.Int64Counter
+	readAttributesCounter      api.Int64Counter
+	readRelationshipsCounter   api.Int64Counter
+	writeRelationshipsCounter  api.Int64Counter
+	deleteRelationshipsCounter api.Int64Counter
+	runBundleCounter           api.Int64Counter
 }
 
 // NewDataServer - Creates new Data Server
@@ -43,17 +43,17 @@ func NewDataServer(
 	sr storage.SchemaReader,
 ) *DataServer {
 	return &DataServer{
-		dr:                           dr,
-		dw:                           dw,
-		br:                           br,
-		sr:                           sr,
-		writeDataHistogram:           telemetry.NewHistogram(internal.Meter, "write_data", "amount", "Number of writing data"),
-		deleteDataHistogram:          telemetry.NewHistogram(internal.Meter, "delete_data", "amount", "Number of deleting data"),
-		readAttributesHistogram:      telemetry.NewHistogram(internal.Meter, "read_attributes", "amount", "Number of reading attributes"),
-		readRelationshipsHistogram:   telemetry.NewHistogram(internal.Meter, "read_relationships", "amount", "Number of reading relationships"),
-		writeRelationshipsHistogram:  telemetry.NewHistogram(internal.Meter, "write_relationships", "amount", "Number of writing relationships"),
-		deleteRelationshipsHistogram: telemetry.NewHistogram(internal.Meter, "delete_relationships", "amount", "Number of deleting relationships"),
-		runBundleHistogram:           telemetry.NewHistogram(internal.Meter, "run_bundle", "amount", "Number of running bunble"),
+		dr:                         dr,
+		dw:                         dw,
+		br:                         br,
+		sr:                         sr,
+		writeDataCounter:           telemetry.NewCounter(internal.Meter, "write_data", "Number of writing data"),
+		deleteDataCounter:          telemetry.NewCounter(internal.Meter, "delete_data", "Number of deleting data"),
+		readAttributesCounter:      telemetry.NewCounter(internal.Meter, "read_attributes", "Number of reading attributes"),
+		readRelationshipsCounter:   telemetry.NewCounter(internal.Meter, "read_relationships", "Number of reading relationships"),
+		writeRelationshipsCounter:  telemetry.NewCounter(internal.Meter, "write_relationships", "Number of writing relationships"),
+		deleteRelationshipsCounter: telemetry.NewCounter(internal.Meter, "delete_relationships", "Number of deleting relationships"),
+		runBundleCounter:           telemetry.NewCounter(internal.Meter, "run_bundle", "Number of running bundle"),
 	}
 }
 
@@ -98,7 +98,7 @@ func (r *DataServer) ReadRelationships(ctx context.Context, request *v1.Relation
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.readRelationshipsHistogram.Record(ctx, 1)
+	r.readRelationshipsCounter.Add(ctx, 1)
 
 	return &v1.RelationshipReadResponse{
 		Tuples:          collection.GetTuples(),
@@ -147,7 +147,7 @@ func (r *DataServer) ReadAttributes(ctx context.Context, request *v1.AttributeRe
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.readAttributesHistogram.Record(ctx, 1)
+	r.readAttributesCounter.Add(ctx, 1)
 
 	return &v1.AttributeReadResponse{
 		Attributes:      collection.GetAttributes(),
@@ -245,7 +245,7 @@ func (r *DataServer) Write(ctx context.Context, request *v1.DataWriteRequest) (*
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.writeDataHistogram.Record(ctx, 1)
+	r.writeDataCounter.Add(ctx, 1)
 
 	return &v1.DataWriteResponse{
 		SnapToken: snap.String(),
@@ -312,7 +312,7 @@ func (r *DataServer) WriteRelationships(ctx context.Context, request *v1.Relatio
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.writeRelationshipsHistogram.Record(ctx, 1)
+	r.writeRelationshipsCounter.Add(ctx, 1)
 
 	return &v1.RelationshipWriteResponse{
 		SnapToken: snap.String(),
@@ -342,7 +342,7 @@ func (r *DataServer) Delete(ctx context.Context, request *v1.DataDeleteRequest) 
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.deleteDataHistogram.Record(ctx, 1)
+	r.deleteDataCounter.Add(ctx, 1)
 
 	return &v1.DataDeleteResponse{
 		SnapToken: snap.String(),
@@ -372,7 +372,7 @@ func (r *DataServer) DeleteRelationships(ctx context.Context, request *v1.Relati
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.deleteRelationshipsHistogram.Record(ctx, 1)
+	r.deleteRelationshipsCounter.Add(ctx, 1)
 
 	return &v1.RelationshipDeleteResponse{
 		SnapToken: snap.String(),
@@ -410,7 +410,7 @@ func (r *DataServer) RunBundle(ctx context.Context, request *v1.BundleRunRequest
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.runBundleHistogram.Record(ctx, 1)
+	r.runBundleCounter.Add(ctx, 1)
 
 	return &v1.BundleRunResponse{
 		SnapToken: snap.String(),

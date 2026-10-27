@@ -24,21 +24,21 @@ import (
 type SchemaServer struct {
 	v1.UnimplementedSchemaServer
 
-	sw                   storage.SchemaWriter
-	sr                   storage.SchemaReader
-	writeSchemaHistogram api.Int64Histogram
-	readSchemaHistogram  api.Int64Histogram
-	listSchemaHistogram  api.Int64Histogram
+	sw                 storage.SchemaWriter
+	sr                 storage.SchemaReader
+	writeSchemaCounter api.Int64Counter
+	readSchemaCounter  api.Int64Counter
+	listSchemaCounter  api.Int64Counter
 }
 
 // NewSchemaServer - Creates new Schema Server
 func NewSchemaServer(sw storage.SchemaWriter, sr storage.SchemaReader) *SchemaServer {
 	return &SchemaServer{
-		sw:                   sw,
-		sr:                   sr,
-		writeSchemaHistogram: telemetry.NewHistogram(internal.Meter, "write_schema", "amount", "Number of writing schema in"),
-		readSchemaHistogram:  telemetry.NewHistogram(internal.Meter, "read_schema", "amount", "Number of reading schema"),
-		listSchemaHistogram:  telemetry.NewHistogram(internal.Meter, "list_schema", "amount", "Number of listing schema"),
+		sw:                 sw,
+		sr:                 sr,
+		writeSchemaCounter: telemetry.NewCounter(internal.Meter, "write_schema", "Number of writing schema"),
+		readSchemaCounter:  telemetry.NewCounter(internal.Meter, "read_schema", "Number of reading schema"),
+		listSchemaCounter:  telemetry.NewCounter(internal.Meter, "list_schema", "Number of listing schema"),
 	}
 }
 
@@ -81,7 +81,7 @@ func (r *SchemaServer) Write(ctx context.Context, request *v1.SchemaWriteRequest
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.writeSchemaHistogram.Record(ctx, 1)
+	r.writeSchemaCounter.Add(ctx, 1)
 
 	return &v1.SchemaWriteResponse{
 		SchemaVersion: version,
@@ -225,7 +225,7 @@ func (r *SchemaServer) Read(ctx context.Context, request *v1.SchemaReadRequest) 
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.readSchemaHistogram.Record(ctx, 1)
+	r.readSchemaCounter.Add(ctx, 1)
 
 	return &v1.SchemaReadResponse{
 		Schema: response,
@@ -253,7 +253,7 @@ func (r *SchemaServer) List(ctx context.Context, request *v1.SchemaListRequest) 
 	}
 
 	// Record metrics
-	r.listSchemaHistogram.Record(ctx, 1)
+	r.listSchemaCounter.Add(ctx, 1)
 	// Return schema list response
 	return &v1.SchemaListResponse{ // Create response
 		Head:            head,

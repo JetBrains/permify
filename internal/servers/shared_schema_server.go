@@ -23,23 +23,23 @@ import (
 type SharedSchemaServer struct {
 	v1.UnimplementedSharedSchemaServer
 
-	ssw                         storage.SharedSchemaWriter
-	ssr                         storage.SharedSchemaReader
-	writeSharedSchemaHistogram  api.Int64Histogram
-	readSharedSchemaHistogram   api.Int64Histogram
-	listSharedSchemaHistogram   api.Int64Histogram
-	assignSharedSchemaHistogram api.Int64Histogram
+	ssw                       storage.SharedSchemaWriter
+	ssr                       storage.SharedSchemaReader
+	writeSharedSchemaCounter  api.Int64Counter
+	readSharedSchemaCounter   api.Int64Counter
+	listSharedSchemaCounter   api.Int64Counter
+	assignSharedSchemaCounter api.Int64Counter
 }
 
 // NewSharedSchemaServer - Creates new Shared Schema Server
 func NewSharedSchemaServer(ssw storage.SharedSchemaWriter, ssr storage.SharedSchemaReader) *SharedSchemaServer {
 	return &SharedSchemaServer{
-		ssw:                         ssw,
-		ssr:                         ssr,
-		writeSharedSchemaHistogram:  telemetry.NewHistogram(internal.Meter, "write_shared_schema", "amount", "Number of writing shared schema"),
-		readSharedSchemaHistogram:   telemetry.NewHistogram(internal.Meter, "read_shared_schema", "amount", "Number of reading shared schema"),
-		listSharedSchemaHistogram:   telemetry.NewHistogram(internal.Meter, "list_shared_schema", "amount", "Number of listing shared schema"),
-		assignSharedSchemaHistogram: telemetry.NewHistogram(internal.Meter, "assign_shared_schema", "amount", "Number of assigning shared schema"),
+		ssw:                       ssw,
+		ssr:                       ssr,
+		writeSharedSchemaCounter:  telemetry.NewCounter(internal.Meter, "write_shared_schema", "Number of writing shared schema"),
+		readSharedSchemaCounter:   telemetry.NewCounter(internal.Meter, "read_shared_schema", "Number of reading shared schema"),
+		listSharedSchemaCounter:   telemetry.NewCounter(internal.Meter, "list_shared_schema", "Number of listing shared schema"),
+		assignSharedSchemaCounter: telemetry.NewCounter(internal.Meter, "assign_shared_schema", "Number of assigning shared schema"),
 	}
 }
 
@@ -82,7 +82,7 @@ func (r *SharedSchemaServer) Write(ctx context.Context, request *v1.SharedSchema
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.writeSharedSchemaHistogram.Record(ctx, 1)
+	r.writeSharedSchemaCounter.Add(ctx, 1)
 
 	return &v1.SharedSchemaWriteResponse{
 		SchemaVersion: version,
@@ -111,7 +111,7 @@ func (r *SharedSchemaServer) Read(ctx context.Context, request *v1.SharedSchemaR
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.readSharedSchemaHistogram.Record(ctx, 1)
+	r.readSharedSchemaCounter.Add(ctx, 1)
 
 	return &v1.SharedSchemaReadResponse{
 		Schema: response,
@@ -139,7 +139,7 @@ func (r *SharedSchemaServer) Assign(ctx context.Context, request *v1.SharedSchem
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.assignSharedSchemaHistogram.Record(ctx, 1)
+	r.assignSharedSchemaCounter.Add(ctx, 1)
 
 	return &v1.SharedSchemaAssignResponse{
 		TenantIds: request.GetTenantIds(),
@@ -159,7 +159,7 @@ func (r *SharedSchemaServer) List(ctx context.Context, request *v1.SharedSchemaL
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
-	r.listSharedSchemaHistogram.Record(ctx, 1)
+	r.listSharedSchemaCounter.Add(ctx, 1)
 
 	return &v1.SharedSchemaListResponse{
 		Schemas:         schemas,
