@@ -92,6 +92,8 @@ func (w *Watch) Watch(ctx context.Context, tenantID, snap string) (<-chan *base.
 		w.eventsCounter.Add(ctx, 1, watchEventErrorAttrs)
 		// If there is an error in decoding the snapshot, send the error and return.
 		errs <- err
+		close(changes)
+		close(errs)
 		// Log decode error
 		slog.Error("failed to decode snapshot", slog.Any("error", err))
 		// Return channels

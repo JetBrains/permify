@@ -1,6 +1,7 @@
 package servers
 
 import (
+	"context"
 	"log/slog"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -59,7 +60,7 @@ func (r *WatchServer) Watch(request *v1.WatchRequest, server v1.Watch_WatchServe
 	v := request.Validate()
 	if v != nil {
 		slog.WarnContext(ctx, "watch request validation failed", "tenant_id", request.GetTenantId(), "error", v.Error())
-		return v // Return validation error, if any.
+		return status.Error(GetStatus(v), v.Error()) // Return validation error, if any.
 	}
 
 	// Extract the snapshot token from the request.
@@ -69,35 +70,86 @@ func (r *WatchServer) Watch(request *v1.WatchRequest, server v1.Watch_WatchServe
 		st, err := r.dr.HeadSnapshot(ctx, request.GetTenantId())
 		if err != nil {
 			slog.ErrorContext(ctx, "failed to resolve watch snapshot", "tenant_id", request.GetTenantId(), "error", err.Error())
-			return err // If there's an error retrieving the snapshot, return it.
+			return status.Error(GetStatus(err), err.Error()) // If there's an error retrieving the snapshot, return it.
 		}
 		// Encode the snapshot to a string.
 		snap = st.Encode().String()
 	}
 
 	// Call the Watch function on the watcher, which returns two channels.
-	changes, errs := r.w.Watch(ctx, request.GetTenantId(), snap)
+	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	changes, errs := r.w.Watch(watchCtx, request.GetTenantId(), snap)
 
 	// Create a separate goroutine to handle sending changes to the server.
+	sendErrCh := make(chan error, 1)
+	sendDone := make(chan struct{})
+	stopSender := func() {
+		cancel()
+		if sendDone != nil {
+			<-sendDone
+			sendDone = nil
+		}
+	}
+	defer stopSender()
+
 	go func() {
-		for change := range changes {
-			// For each change, send it to the client.
-			if err := server.Send(&v1.WatchResponse{Changes: change}); err != nil {
-				// If an error occurs while sending, exit the goroutine.
-				// The error is not handled here because the context will be cancelled if an error is detected.
+		defer close(sendDone)
+		for {
+			select {
+			case <-watchCtx.Done():
 				return
+			case change, ok := <-changes:
+				if !ok {
+					return
+				}
+				if watchCtx.Err() != nil {
+					return
+				}
+				// For each change, send it to the client.
+				if err := server.Send(&v1.WatchResponse{Changes: change}); err != nil {
+					slog.ErrorContext(ctx, "failed to send watch response", "tenant_id", request.GetTenantId(), "error", err.Error())
+					sendErrCh <- err
+					return
+				}
 			}
 		}
 	}()
 
 	// Main loop for handling errors.
-	for err := range errs {
-		// If an error occurs, convert it to a status error and return it.
-		// This ends the Watch function, which in turn closes the changes channel and ends the above goroutine.
-		return status.Error(GetStatus(err), err.Error())
+	for {
+		select {
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				if sendDone == nil {
+					if ctx.Err() != nil {
+						return status.Error(codes.Canceled, ctx.Err().Error())
+					}
+					return nil
+				}
+				continue
+			}
+			if err != nil {
+				return status.Error(GetStatus(err), err.Error())
+			}
+		case err := <-sendErrCh:
+			return status.Error(GetStatus(err), err.Error())
+		case <-sendDone:
+			sendDone = nil
+			select {
+			case err := <-sendErrCh:
+				return status.Error(GetStatus(err), err.Error())
+			default:
+				if errs == nil && ctx.Err() != nil {
+					return status.Error(codes.Canceled, ctx.Err().Error())
+				}
+				if errs == nil {
+					return nil
+				}
+			}
+		case <-ctx.Done():
+			return status.Error(codes.Canceled, ctx.Err().Error())
+		}
 	}
-
-	// At this point, the errs channel has been closed, indicating that no more errors will be coming in.
-	// Therefore, it's safe to return nil indicating that the operation was successful.
-	return nil
 }
