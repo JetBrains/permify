@@ -343,6 +343,24 @@ func serve() func(cmd *cobra.Command, args []string) error {
 			}()
 		}
 
+		// schema cache
+		var schemaCache pkgcache.Cache
+		schemaCache, err = ristretto.New(ristretto.NumberOfCounters(cfg.Service.Schema.Cache.NumberOfCounters), ristretto.MaxCost(cfg.Service.Schema.Cache.MaxCost))
+		if err != nil {
+			slog.Error(err.Error())
+			return err
+		}
+		defer schemaCache.Close()
+
+		// engines cache cache
+		var engineKeyCache pkgcache.Cache
+		engineKeyCache, err = ristretto.New(ristretto.NumberOfCounters(cfg.Service.Permission.Cache.NumberOfCounters), ristretto.MaxCost(cfg.Service.Permission.Cache.MaxCost))
+		if err != nil {
+			slog.Error(err.Error())
+			return err
+		}
+		defer engineKeyCache.Close()
+
 		if cfg.Meter.Enabled {
 			headers := map[string]string{}
 			for _, header := range cfg.Meter.Headers {
@@ -375,22 +393,6 @@ func serve() func(cmd *cobra.Command, args []string) error {
 					slog.Error(err.Error())
 				}
 			}()
-		}
-
-		// schema cache
-		var schemaCache pkgcache.Cache
-		schemaCache, err = ristretto.New(ristretto.NumberOfCounters(cfg.Service.Schema.Cache.NumberOfCounters), ristretto.MaxCost(cfg.Service.Schema.Cache.MaxCost))
-		if err != nil {
-			slog.Error(err.Error())
-			return err
-		}
-
-		// engines cache cache
-		var engineKeyCache pkgcache.Cache
-		engineKeyCache, err = ristretto.New(ristretto.NumberOfCounters(cfg.Service.Permission.Cache.NumberOfCounters), ristretto.MaxCost(cfg.Service.Permission.Cache.MaxCost))
-		if err != nil {
-			slog.Error(err.Error())
-			return err
 		}
 
 		watcher := storage.NewNoopWatcher()

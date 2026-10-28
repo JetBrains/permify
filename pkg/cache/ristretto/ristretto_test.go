@@ -1,9 +1,13 @@
 package ristretto
 
 import (
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRistretto(t *testing.T) {
@@ -81,4 +85,32 @@ func TestRistretto_Set(t *testing.T) {
 
 	// Close the cache
 	cache.Close()
+}
+
+func TestRistretto_CloseStopsBackgroundGoroutines(t *testing.T) {
+	countRistrettoGoroutines := func() int {
+		buf := make([]byte, 1<<20)
+		for {
+			n := runtime.Stack(buf, true)
+			if n < len(buf) {
+				stacks := string(buf[:n])
+				return strings.Count(stacks, "ristretto.(*Cache[") +
+					strings.Count(stacks, "ristretto.(*defaultPolicy[")
+			}
+			buf = make([]byte, len(buf)*2)
+		}
+	}
+
+	before := countRistrettoGoroutines()
+
+	cache, err := New()
+	require.NoError(t, err)
+
+	require.Greater(t, countRistrettoGoroutines(), before, "ristretto should spawn background goroutines")
+
+	cache.Close()
+
+	require.Eventually(t, func() bool {
+		return countRistrettoGoroutines() == before
+	}, time.Second, 5*time.Millisecond, "ristretto background goroutines leaked after Close()")
 }
