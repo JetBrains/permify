@@ -253,12 +253,19 @@ func TestServerSLOAndErrorCounters(t *testing.T) {
 	})
 	require.Error(t, err)
 
-	// Batch check failure inside BulkCheck triggers bulk_check_batch_errors and permission_server_errors
+	// Batch check failure inside BulkCheck is reported as a denied item, not an RPC error.
 	_, err = permSrv.BulkCheck(ctx, &v1.PermissionBulkCheckRequest{
 		TenantId: "t1",
 		Items: []*v1.PermissionBulkCheckRequestItem{
 			{Entity: &v1.Entity{Type: "doc", Id: "1"}, Permission: "view", Subject: &v1.Subject{Type: "user", Id: "1"}},
 		},
+	})
+	require.NoError(t, err)
+
+	// Invalid BulkCheck items are counted separately from RPC failures.
+	_, err = permSrv.BulkCheck(ctx, &v1.PermissionBulkCheckRequest{
+		TenantId: "t1",
+		Items:    []*v1.PermissionBulkCheckRequestItem{{}},
 	})
 	require.NoError(t, err)
 
@@ -281,6 +288,7 @@ func TestServerSLOAndErrorCounters(t *testing.T) {
 		"list_tenant",
 		"bulk_check_limit_exceeded",
 		"bulk_check_batch_errors",
+		"bulk_check_item_errors",
 	} {
 		m, ok := metrics[name]
 		require.True(t, ok, "missing metric %s", name)
@@ -294,6 +302,13 @@ func TestServerSLOAndErrorCounters(t *testing.T) {
 	require.True(t, ok)
 	require.Len(t, permErrSum.DataPoints, 1)
 	method, _ := permErrSum.DataPoints[0].Attributes.Value(attribute.Key("method"))
+	code, _ := permErrSum.DataPoints[0].Attributes.Value(attribute.Key("code"))
 	assert.Equal(t, "bulk_check", method.AsString())
-	assert.Equal(t, int64(2), permErrSum.DataPoints[0].Value)
+	assert.Equal(t, "InvalidArgument", code.AsString())
+	assert.Equal(t, int64(1), permErrSum.DataPoints[0].Value)
+
+	itemErrSum, ok := metrics["bulk_check_item_errors"].Data.(metricdata.Sum[int64])
+	require.True(t, ok)
+	require.Len(t, itemErrSum.DataPoints, 1)
+	assert.Equal(t, int64(1), itemErrSum.DataPoints[0].Value)
 }

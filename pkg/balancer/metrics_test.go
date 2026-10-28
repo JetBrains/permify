@@ -93,7 +93,6 @@ func TestConsistentBalancerMetrics(t *testing.T) {
 
 	assert.Equal(t, map[string]int64{
 		"ok":             1,
-		"resolver_error": 1,
 		"zero_addresses": 1,
 	}, resolverResults)
 	assert.Equal(t, map[string]int64{

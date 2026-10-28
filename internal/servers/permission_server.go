@@ -2,16 +2,15 @@ package servers
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 
 	"go.opentelemetry.io/otel/attribute"
 	otelCodes "go.opentelemetry.io/otel/codes"
 	api "go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/semaphore"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/Permify/permify/internal"
@@ -21,14 +20,44 @@ import (
 )
 
 var (
-	permCheckErrAttrs             = api.WithAttributeSet(attribute.NewSet(attribute.String("method", "check")))
-	permBulkCheckErrAttrs         = api.WithAttributeSet(attribute.NewSet(attribute.String("method", "bulk_check")))
-	permExpandErrAttrs            = api.WithAttributeSet(attribute.NewSet(attribute.String("method", "expand")))
-	permLookupEntityErrAttrs      = api.WithAttributeSet(attribute.NewSet(attribute.String("method", "lookup_entity")))
-	permLookupEntityStreamErrAttr = api.WithAttributeSet(attribute.NewSet(attribute.String("method", "lookup_entity_stream")))
-	permLookupSubjectErrAttrs     = api.WithAttributeSet(attribute.NewSet(attribute.String("method", "lookup_subject")))
-	permSubjectPermissionErrAttrs = api.WithAttributeSet(attribute.NewSet(attribute.String("method", "subject_permission")))
+	bulkCheckItemValidationAttrs        = api.WithAttributeSet(attribute.NewSet(attribute.String("reason", "validation")))
+	permissionErrorAttrsByMethodAndCode = func() map[string]map[codes.Code]api.MeasurementOption {
+		methods := []string{
+			"check",
+			"bulk_check",
+			"expand",
+			"lookup_entity",
+			"lookup_entity_stream",
+			"lookup_subject",
+			"subject_permission",
+		}
+		out := make(map[string]map[codes.Code]api.MeasurementOption, len(methods))
+		for _, m := range methods {
+			byCode := make(map[codes.Code]api.MeasurementOption, 17)
+			for c := codes.OK; c <= codes.Unauthenticated; c++ {
+				byCode[c] = api.WithAttributeSet(attribute.NewSet(
+					attribute.String("method", m),
+					attribute.String("code", c.String()),
+				))
+			}
+			out[m] = byCode
+		}
+		return out
+	}()
 )
+
+func permissionErrorAttrs(method string, err error) api.MeasurementOption {
+	code := status.Code(err)
+	if byCode, ok := permissionErrorAttrsByMethodAndCode[method]; ok {
+		if opt, ok := byCode[code]; ok {
+			return opt
+		}
+	}
+	return api.WithAttributeSet(attribute.NewSet(
+		attribute.String("method", method),
+		attribute.String("code", code.String()),
+	))
+}
 
 // PermissionServer - Structure for Permission Server
 type PermissionServer struct {
@@ -39,6 +68,7 @@ type PermissionServer struct {
 	bulkLimit                int
 	bulkLimitExceededCounter api.Int64Counter
 	bulkBatchErrorsCounter   api.Int64Counter
+	bulkItemErrorsCounter    api.Int64Counter
 	errorsCounter            api.Int64Counter
 }
 
@@ -56,7 +86,8 @@ func NewPermissionServer(i invoke.Invoker, concurrencyLimit, bulkLimit int) *Per
 		bulkLimit:                bulkLimit,
 		bulkLimitExceededCounter: telemetry.NewCounter(internal.Meter, "bulk_check_limit_exceeded", "Number of BulkCheck requests rejected because the number of items exceeded bulk_limit"),
 		bulkBatchErrorsCounter:   telemetry.NewCounter(internal.Meter, "bulk_check_batch_errors", "Number of batch check groups that failed inside a BulkCheck request"),
-		errorsCounter:            telemetry.NewCounter(internal.Meter, "permission_server_errors", "Number of failed PermissionServer RPC calls, by method"),
+		bulkItemErrorsCounter:    telemetry.NewCounter(internal.Meter, "bulk_check_item_errors", "Number of invalid items returned as denied results in BulkCheck responses, by reason"),
+		errorsCounter:            telemetry.NewCounter(internal.Meter, "permission_server_errors", "Number of PermissionServer method calls that returned a gRPC error, by method"),
 	}
 }
 
@@ -68,17 +99,24 @@ func (r *PermissionServer) Check(ctx context.Context, request *v1.PermissionChec
 
 	v := request.Validate()
 	if v != nil {
-		r.errorsCounter.Add(ctx, 1, permCheckErrAttrs)
-		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
+		rpcErr := status.Error(GetStatus(v), v.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("check", rpcErr))
+		return nil, rpcErr // Return validation error
 	}
 
 	response, err := r.invoker.Check(ctx, invoke.NewBatchCheckRequest(request))
 	if err != nil {
-		r.errorsCounter.Add(ctx, 1, permCheckErrAttrs)
+		rpcErr := status.Error(GetStatus(err), err.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("check", rpcErr))
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
-		slog.ErrorContext(ctx, err.Error())
-		return nil, status.Error(GetStatus(err), err.Error())
+		slog.ErrorContext(ctx, "permission check failed",
+			"tenant_id", request.GetTenantId(),
+			"entity_type", request.GetEntity().GetType(),
+			"permission", request.GetPermission(),
+			"error", err.Error(),
+		)
+		return nil, rpcErr
 	}
 
 	return response.ToPermissionCheckResponse(), nil
@@ -97,8 +135,8 @@ func (r *PermissionServer) BulkCheck(ctx context.Context, request *v1.Permission
 
 	// Validate tenant_id
 	if request.GetTenantId() == "" {
-		r.errorsCounter.Add(ctx, 1, permBulkCheckErrAttrs)
 		err := status.Error(GetStatus(nil), "tenant_id is required")
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("bulk_check", err))
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		return nil, err
@@ -108,8 +146,8 @@ func (r *PermissionServer) BulkCheck(ctx context.Context, request *v1.Permission
 
 	// Validate number of requests
 	if len(checkItems) == 0 {
-		r.errorsCounter.Add(ctx, 1, permBulkCheckErrAttrs)
 		err := status.Error(GetStatus(nil), "at least one item is required")
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("bulk_check", err))
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		return nil, err
@@ -117,8 +155,8 @@ func (r *PermissionServer) BulkCheck(ctx context.Context, request *v1.Permission
 
 	if len(checkItems) > r.bulkLimit {
 		r.bulkLimitExceededCounter.Add(ctx, 1)
-		r.errorsCounter.Add(ctx, 1, permBulkCheckErrAttrs)
 		err := status.Error(GetStatus(nil), fmt.Sprintf("maximum %d items allowed", r.bulkLimit))
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("bulk_check", err))
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		return nil, err
@@ -140,6 +178,8 @@ func (r *PermissionServer) BulkCheck(ctx context.Context, request *v1.Permission
 
 	for i, item := range checkItems {
 		if v := item.Validate(); v != nil {
+			r.bulkItemErrorsCounter.Add(ctx, 1, bulkCheckItemValidationAttrs)
+			slog.WarnContext(ctx, "invalid item in bulk check", "tenant_id", request.GetTenantId(), "item_index", i, "error", v.Error())
 			results[i] = &v1.PermissionCheckResponse{
 				Can:      v1.CheckResult_CHECK_RESULT_DENIED,
 				Metadata: &v1.PermissionCheckResponseMetadata{},
@@ -166,7 +206,6 @@ func (r *PermissionServer) BulkCheck(ctx context.Context, request *v1.Permission
 
 	// Execute each group as a batch check, concurrently.
 	var wg sync.WaitGroup
-	var hadBatchErr atomic.Bool
 	for key, g := range groups {
 		wg.Add(1)
 		go func(key groupKey, g *groupEntry) {
@@ -185,9 +224,8 @@ func (r *PermissionServer) BulkCheck(ctx context.Context, request *v1.Permission
 
 			resp, err := r.invoker.Check(ctx, batchReq)
 			if err != nil {
-				hadBatchErr.Store(true)
 				r.bulkBatchErrorsCounter.Add(ctx, 1)
-				slog.ErrorContext(ctx, "batch check failed in bulk operation", "error", err.Error())
+				slog.ErrorContext(ctx, "batch check failed in bulk operation", "tenant_id", request.GetTenantId(), "entity_type", key.entityType, "permission", key.permission, "error", err.Error())
 				for _, idx := range g.indices {
 					results[idx] = &v1.PermissionCheckResponse{
 						Can:      v1.CheckResult_CHECK_RESULT_DENIED,
@@ -214,13 +252,10 @@ func (r *PermissionServer) BulkCheck(ctx context.Context, request *v1.Permission
 
 	// Check for context cancellation.
 	if ctx.Err() != nil {
-		r.errorsCounter.Add(ctx, 1, permBulkCheckErrAttrs)
-		return emptyResp, errors.New(v1.ErrorCode_ERROR_CODE_CANCELLED.String())
+		err := status.Error(codes.Canceled, v1.ErrorCode_ERROR_CODE_CANCELLED.String())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("bulk_check", err))
+		return emptyResp, err
 	}
-	if hadBatchErr.Load() {
-		r.errorsCounter.Add(ctx, 1, permBulkCheckErrAttrs)
-	}
-
 	return &v1.PermissionBulkCheckResponse{
 		Results: results,
 	}, nil
@@ -234,17 +269,24 @@ func (r *PermissionServer) Expand(ctx context.Context, request *v1.PermissionExp
 
 	v := request.Validate()
 	if v != nil {
-		r.errorsCounter.Add(ctx, 1, permExpandErrAttrs)
-		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
+		rpcErr := status.Error(GetStatus(v), v.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("expand", rpcErr))
+		return nil, rpcErr // Return validation error
 	}
 
 	response, err := r.invoker.Expand(ctx, request)
 	if err != nil {
-		r.errorsCounter.Add(ctx, 1, permExpandErrAttrs)
+		rpcErr := status.Error(GetStatus(err), err.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("expand", rpcErr))
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
-		slog.ErrorContext(ctx, err.Error())
-		return nil, status.Error(GetStatus(err), err.Error())
+		slog.ErrorContext(ctx, "permission expand failed",
+			"tenant_id", request.GetTenantId(),
+			"entity_type", request.GetEntity().GetType(),
+			"permission", request.GetPermission(),
+			"error", err.Error(),
+		)
+		return nil, rpcErr
 	}
 
 	return response, nil
@@ -258,17 +300,24 @@ func (r *PermissionServer) LookupEntity(ctx context.Context, request *v1.Permiss
 
 	v := request.Validate()
 	if v != nil {
-		r.errorsCounter.Add(ctx, 1, permLookupEntityErrAttrs)
-		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
+		rpcErr := status.Error(GetStatus(v), v.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("lookup_entity", rpcErr))
+		return nil, rpcErr // Return validation error
 	}
 
 	response, err := r.invoker.LookupEntity(ctx, request)
 	if err != nil {
-		r.errorsCounter.Add(ctx, 1, permLookupEntityErrAttrs)
+		rpcErr := status.Error(GetStatus(err), err.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("lookup_entity", rpcErr))
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
-		slog.ErrorContext(ctx, err.Error())
-		return nil, status.Error(GetStatus(err), err.Error())
+		slog.ErrorContext(ctx, "permission lookup entity failed",
+			"tenant_id", request.GetTenantId(),
+			"entity_type", request.GetEntityType(),
+			"permission", request.GetPermission(),
+			"error", err.Error(),
+		)
+		return nil, rpcErr
 	}
 
 	return response, nil
@@ -282,17 +331,24 @@ func (r *PermissionServer) LookupEntityStream(request *v1.PermissionLookupEntity
 
 	v := request.Validate()
 	if v != nil {
-		r.errorsCounter.Add(ctx, 1, permLookupEntityStreamErrAttr)
-		return v
+		rpcErr := status.Error(GetStatus(v), v.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("lookup_entity_stream", rpcErr))
+		return rpcErr
 	}
 
 	err := r.invoker.LookupEntityStream(ctx, request, server)
 	if err != nil {
-		r.errorsCounter.Add(ctx, 1, permLookupEntityStreamErrAttr)
+		rpcErr := status.Error(GetStatus(err), err.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("lookup_entity_stream", rpcErr))
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
-		slog.ErrorContext(ctx, err.Error())
-		return status.Error(GetStatus(err), err.Error())
+		slog.ErrorContext(ctx, "permission lookup entity stream failed",
+			"tenant_id", request.GetTenantId(),
+			"entity_type", request.GetEntityType(),
+			"permission", request.GetPermission(),
+			"error", err.Error(),
+		)
+		return rpcErr
 	}
 
 	return nil
@@ -306,17 +362,24 @@ func (r *PermissionServer) LookupSubject(ctx context.Context, request *v1.Permis
 
 	v := request.Validate()
 	if v != nil {
-		r.errorsCounter.Add(ctx, 1, permLookupSubjectErrAttrs)
-		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
+		rpcErr := status.Error(GetStatus(v), v.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("lookup_subject", rpcErr))
+		return nil, rpcErr // Return validation error
 	}
 
 	response, err := r.invoker.LookupSubject(ctx, request)
 	if err != nil {
-		r.errorsCounter.Add(ctx, 1, permLookupSubjectErrAttrs)
+		rpcErr := status.Error(GetStatus(err), err.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("lookup_subject", rpcErr))
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
-		slog.ErrorContext(ctx, err.Error())
-		return nil, status.Error(GetStatus(err), err.Error())
+		slog.ErrorContext(ctx, "permission lookup subject failed",
+			"tenant_id", request.GetTenantId(),
+			"entity_type", request.GetEntity().GetType(),
+			"permission", request.GetPermission(),
+			"error", err.Error(),
+		)
+		return nil, rpcErr
 	}
 
 	return response, nil
@@ -330,17 +393,23 @@ func (r *PermissionServer) SubjectPermission(ctx context.Context, request *v1.Pe
 
 	v := request.Validate()
 	if v != nil {
-		r.errorsCounter.Add(ctx, 1, permSubjectPermissionErrAttrs)
-		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
+		rpcErr := status.Error(GetStatus(v), v.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("subject_permission", rpcErr))
+		return nil, rpcErr // Return validation error
 	}
 
 	response, err := r.invoker.SubjectPermission(ctx, request)
 	if err != nil {
-		r.errorsCounter.Add(ctx, 1, permSubjectPermissionErrAttrs)
+		rpcErr := status.Error(GetStatus(err), err.Error())
+		r.errorsCounter.Add(ctx, 1, permissionErrorAttrs("subject_permission", rpcErr))
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
-		slog.ErrorContext(ctx, err.Error())
-		return nil, status.Error(GetStatus(err), err.Error())
+		slog.ErrorContext(ctx, "subject permission failed",
+			"tenant_id", request.GetTenantId(),
+			"entity_type", request.GetEntity().GetType(),
+			"error", err.Error(),
+		)
+		return nil, rpcErr
 	}
 
 	return response, nil

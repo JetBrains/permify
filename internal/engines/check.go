@@ -36,10 +36,11 @@ type CheckEngine struct {
 	// maxBatchSize is the maximum number of entity IDs per batch SQL query (IN clause)
 	maxBatchSize int
 
-	meter                   metric.Meter
-	batchSplitsCounter      metric.Int64Counter
-	concurrencyWaitsCounter metric.Int64Counter
-	celEvaluationsCounter   metric.Int64Counter
+	meter                      metric.Meter
+	batchSplitsCounter         metric.Int64Counter
+	concurrencyWaitsCounter    metric.Int64Counter
+	concurrencyAttemptsCounter metric.Int64Counter
+	celEvaluationsCounter      metric.Int64Counter
 }
 
 // NewCheckEngine creates a new CheckEngine instance for performing permission checks.
@@ -62,6 +63,7 @@ func NewCheckEngine(sr storage.SchemaReader, rr storage.DataReader, opts ...Chec
 
 	engine.batchSplitsCounter = telemetry.NewCounter(engine.meter, "engine_batch_splits", "Number of times an entity or subject batch exceeded bulk_limit and was split into an additional batch, by engine")
 	engine.concurrencyWaitsCounter = telemetry.NewCounter(engine.meter, "concurrency_limit_waits", "Number of times a request had to wait for a concurrency limit slot, by scope")
+	engine.concurrencyAttemptsCounter = telemetry.NewCounter(engine.meter, "concurrency_limit_acquire_attempts", "Number of attempts to acquire a request concurrency slot, by scope")
 	engine.celEvaluationsCounter = telemetry.NewCounter(engine.meter, "cel_evaluations", "Number of CEL rule expression evaluations, by result")
 
 	return engine
@@ -1128,6 +1130,7 @@ func (engine *CheckEngine) checkRun(ctx context.Context, functions []CheckFuncti
 				return
 			}
 			child := fun
+			engine.concurrencyAttemptsCounter.Add(ctx, 1, checkConcurrencyAttemptAttrs)
 			select {
 			case cl <- struct{}{}:
 			case <-ctx.Done():

@@ -41,6 +41,8 @@ var (
 	jwksRetryAttrs              = metric.WithAttributeSet(attribute.NewSet(attribute.String("reason", "retry")))
 	jwksBackoffActiveAttrs      = metric.WithAttributeSet(attribute.NewSet(attribute.String("reason", "backoff_active")))
 	jwksMaxRetriesExceededAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("reason", "max_retries_exceeded")))
+	jwksHTTPResultOkAttrs       = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "ok")))
+	jwksHTTPResultErrorAttrs    = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "error")))
 )
 
 func oidcAuthAttrs(result, reason string) metric.MeasurementOption {
@@ -94,10 +96,26 @@ type Authn struct {
 	retriedKeys      map[string]bool
 	mutex            sync.Mutex // protects concurrent access to retry state
 
-	meter               metric.Meter
-	requestsCounter     metric.Int64Counter
-	jwksRequestsCounter metric.Int64Counter
-	jwksRetriesCounter  metric.Int64Counter
+	meter                   metric.Meter
+	requestsCounter         metric.Int64Counter
+	jwksRequestsCounter     metric.Int64Counter
+	jwksHTTPRequestsCounter metric.Int64Counter
+	jwksRetriesCounter      metric.Int64Counter
+}
+
+type jwksCountingRoundTripper struct {
+	next    http.RoundTripper
+	counter metric.Int64Counter
+}
+
+func (rt *jwksCountingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := rt.next.RoundTrip(request)
+	if err != nil || response == nil || response.StatusCode >= http.StatusBadRequest {
+		rt.counter.Add(request.Context(), 1, jwksHTTPResultErrorAttrs)
+	} else {
+		rt.counter.Add(request.Context(), 1, jwksHTTPResultOkAttrs)
+	}
+	return response, err
 }
 
 // NewOidcAuthn creates a new OIDC authenticator.
@@ -154,7 +172,20 @@ func NewOidcAuthn(ctx context.Context, conf config.Oidc, opts ...Option) (*Authn
 	}
 	oidc.requestsCounter = telemetry.NewCounter(oidc.meter, "authn_requests", "Number of authentication requests, by method, result and reason")
 	oidc.jwksRequestsCounter = telemetry.NewCounter(oidc.meter, "oidc_jwks_cache_operations", "Number of AutoRefresh Fetch and Refresh API calls, including cache hits, by operation and result")
+	oidc.jwksHTTPRequestsCounter = telemetry.NewCounter(oidc.meter, "oidc_jwks_http_requests", "Number of actual HTTP attempts made to the OIDC JWKS endpoint, by result")
 	oidc.jwksRetriesCounter = telemetry.NewCounter(oidc.meter, "oidc_jwks_retries", "Number of OIDC JWKS retry and backoff events, by reason")
+
+	// Count real HTTP attempts to the JWKS endpoint (initial fetch, background refreshes and retries).
+	// The retryable client resolves HTTPClient.Transport on every request, so wrapping it before the
+	// first Fetch is enough even though AutoRefresh is configured above.
+	transport := client.HTTPClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	client.HTTPClient.Transport = &jwksCountingRoundTripper{
+		next:    transport,
+		counter: oidc.jwksHTTPRequestsCounter,
+	}
 
 	// Attempt to fetch the JWKS immediately to ensure it's available and valid.
 	if _, err := oidc.jwksSet.Fetch(ctx, oidc.JwksURI); err != nil {

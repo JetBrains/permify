@@ -58,7 +58,8 @@ func WithDataWriterMeter(meter metric.Meter) DataWriterOption {
 
 // DataWriter - Structure for Data Writer
 type DataWriter struct {
-	database *db.Postgres
+	database     *db.Postgres
+	writeAttempt func(context.Context, string, *database.TupleCollection, *database.AttributeCollection) (token.EncodedSnapToken, error)
 	// options
 	txOptions pgx.TxOptions
 
@@ -79,9 +80,10 @@ func NewDataWriter(database *db.Postgres, opts ...DataWriterOption) *DataWriter 
 		opt(w)
 	}
 	w.txCounter = telemetry.NewCounter(w.meter, "database_write_tx", "Number of DataWriter transactions, by operation and result")
-	w.txRetriesCounter = telemetry.NewCounter(w.meter, "database_tx_retries", "Number of PostgreSQL serializable transaction retries in DataWriter, by operation")
-	w.maxRetriesExceededCounter = telemetry.NewCounter(w.meter, "database_max_retries_exceeded", "Number of PostgreSQL transactions in DataWriter that failed after exhausting max_retries, by operation")
+	w.txRetriesCounter = telemetry.NewCounter(w.meter, "database_tx_retries", "Number of retryable database transaction attempts performed by DataWriter, by operation")
+	w.maxRetriesExceededCounter = telemetry.NewCounter(w.meter, "database_max_retries_exceeded", "Number of DataWriter operations that failed after exhausting max_retries, by operation")
 	w.maxDataPerWriteExcdCounter = telemetry.NewCounter(w.meter, "database_max_data_per_write_exceeded", "Number of DataWriter.Write calls rejected because tuple and attribute count exceeded max_data_per_write")
+	w.writeAttempt = w.write
 	return w
 }
 
@@ -109,15 +111,32 @@ func (w *DataWriter) Write(
 
 	// Retry loop for handling transient errors like serialization issues.
 	for i := 0; i <= w.database.GetMaxRetries(); i++ {
+		if ctx.Err() != nil {
+			w.txCounter.Add(ctx, 1, txWriteErrorAttrs)
+			return nil, utils.HandleError(ctx, span, ctx.Err(), base.ErrorCode_ERROR_CODE_DATASTORE)
+		}
+		if i > 0 {
+			w.txRetriesCounter.Add(ctx, 1, txWriteOpAttrs)
+		}
 		// Attempt to write the data to the database.
-		tkn, err := w.write(ctx, tenantID, tupleCollection, attributeCollection)
+		tkn, err := w.writeAttempt(ctx, tenantID, tupleCollection, attributeCollection)
 		if err != nil {
 			// Check if the error is due to serialization, and if so, retry.
 			if utils.IsSerializationRelatedError(err) || pgconn.SafeToRetry(err) {
-				w.txRetriesCounter.Add(ctx, 1, txWriteOpAttrs)
-				slog.WarnContext(ctx, "serialization error occurred", slog.String("tenant_id", tenantID), slog.Int("retry", i))
-				utils.WaitWithBackoff(ctx, tenantID, i)
-				continue // Retry the operation.
+				if ctx.Err() != nil {
+					w.txCounter.Add(ctx, 1, txWriteErrorAttrs)
+					return nil, utils.HandleError(ctx, span, ctx.Err(), base.ErrorCode_ERROR_CODE_DATASTORE)
+				}
+				if i < w.database.GetMaxRetries() {
+					utils.WaitWithBackoff(ctx, tenantID, i)
+					if ctx.Err() != nil {
+						w.txCounter.Add(ctx, 1, txWriteErrorAttrs)
+						return nil, utils.HandleError(ctx, span, ctx.Err(), base.ErrorCode_ERROR_CODE_DATASTORE)
+					}
+					slog.WarnContext(ctx, "retryable database error occurred; retrying transaction", slog.String("tenant_id", tenantID), slog.Int("retry", i+1))
+					continue // Retry the operation.
+				}
+				break
 			}
 			w.txCounter.Add(ctx, 1, txWriteErrorAttrs)
 			// If the error is not serialization-related, handle it and return.
@@ -154,15 +173,32 @@ func (w *DataWriter) Delete(
 	// Retry loop with backoff
 	// Retry loop for handling transient errors like serialization issues.
 	for i := 0; i <= w.database.GetMaxRetries(); i++ {
+		if ctx.Err() != nil {
+			w.txCounter.Add(ctx, 1, txDeleteErrorAttrs)
+			return nil, utils.HandleError(ctx, span, ctx.Err(), base.ErrorCode_ERROR_CODE_DATASTORE)
+		}
+		if i > 0 {
+			w.txRetriesCounter.Add(ctx, 1, txDeleteOpAttrs)
+		}
 		// Attempt to delete the data from the database.
 		tkn, err := w.delete(ctx, tenantID, tupleFilter, attributeFilter)
 		if err != nil {
 			// Check if the error is due to serialization, and if so, retry.
 			if utils.IsSerializationRelatedError(err) || pgconn.SafeToRetry(err) {
-				w.txRetriesCounter.Add(ctx, 1, txDeleteOpAttrs)
-				slog.WarnContext(ctx, "serialization error occurred", slog.String("tenant_id", tenantID), slog.Int("retry", i))
-				utils.WaitWithBackoff(ctx, tenantID, i)
-				continue // Retry the operation.
+				if ctx.Err() != nil {
+					w.txCounter.Add(ctx, 1, txDeleteErrorAttrs)
+					return nil, utils.HandleError(ctx, span, ctx.Err(), base.ErrorCode_ERROR_CODE_DATASTORE)
+				}
+				if i < w.database.GetMaxRetries() {
+					utils.WaitWithBackoff(ctx, tenantID, i)
+					if ctx.Err() != nil {
+						w.txCounter.Add(ctx, 1, txDeleteErrorAttrs)
+						return nil, utils.HandleError(ctx, span, ctx.Err(), base.ErrorCode_ERROR_CODE_DATASTORE)
+					}
+					slog.WarnContext(ctx, "retryable database error occurred; retrying transaction", slog.String("tenant_id", tenantID), slog.Int("retry", i+1))
+					continue // Retry the operation.
+				}
+				break
 			}
 			w.txCounter.Add(ctx, 1, txDeleteErrorAttrs)
 			// If the error is not serialization-related, handle it and return.
@@ -199,15 +235,32 @@ func (w *DataWriter) RunBundle(
 	// Retry loop with backoff
 	// Retry loop for handling transient errors like serialization issues.
 	for i := 0; i <= w.database.GetMaxRetries(); i++ {
+		if ctx.Err() != nil {
+			w.txCounter.Add(ctx, 1, txRunBundleErrorAttrs)
+			return nil, utils.HandleError(ctx, span, ctx.Err(), base.ErrorCode_ERROR_CODE_DATASTORE)
+		}
+		if i > 0 {
+			w.txRetriesCounter.Add(ctx, 1, txRunBundleOpAttrs)
+		}
 		// Attempt to run the bundle operation.
 		tkn, err := w.runBundle(ctx, tenantID, arguments, b)
 		if err != nil {
 			// Check if the error is due to serialization, and if so, retry.
 			if utils.IsSerializationRelatedError(err) || pgconn.SafeToRetry(err) {
-				w.txRetriesCounter.Add(ctx, 1, txRunBundleOpAttrs)
-				slog.WarnContext(ctx, "serialization error occurred", slog.String("tenant_id", tenantID), slog.Int("retry", i))
-				utils.WaitWithBackoff(ctx, tenantID, i)
-				continue // Retry the operation.
+				if ctx.Err() != nil {
+					w.txCounter.Add(ctx, 1, txRunBundleErrorAttrs)
+					return nil, utils.HandleError(ctx, span, ctx.Err(), base.ErrorCode_ERROR_CODE_DATASTORE)
+				}
+				if i < w.database.GetMaxRetries() {
+					utils.WaitWithBackoff(ctx, tenantID, i)
+					if ctx.Err() != nil {
+						w.txCounter.Add(ctx, 1, txRunBundleErrorAttrs)
+						return nil, utils.HandleError(ctx, span, ctx.Err(), base.ErrorCode_ERROR_CODE_DATASTORE)
+					}
+					slog.WarnContext(ctx, "retryable database error occurred; retrying transaction", slog.String("tenant_id", tenantID), slog.Int("retry", i+1))
+					continue // Retry the operation.
+				}
+				break
 			}
 			w.txCounter.Add(ctx, 1, txRunBundleErrorAttrs)
 			// If the error is not serialization-related, handle it and return.

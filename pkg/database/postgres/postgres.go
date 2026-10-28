@@ -170,7 +170,6 @@ func newDB(writerUri, readerUri string, opts ...Option) (*Postgres, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return pg, nil
 }
 

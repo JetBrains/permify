@@ -123,7 +123,7 @@ func (r *Ristretto) registerMetrics(maxCost uint64) error {
 
 	bufferItemsGauge, err := r.meter.Int64ObservableGauge(
 		"cache_buffer_items",
-		metric.WithDescription("Configured size of the cache Set buffer"),
+		metric.WithDescription("Configured number of Get operations buffered before updating TinyLFU frequency counters"),
 	)
 	if err != nil {
 		return err

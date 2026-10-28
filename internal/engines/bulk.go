@@ -101,6 +101,8 @@ type BulkChecker struct {
 	// Callback for processing results
 	// callback is invoked for each successful permission check with the entity/subject ID and continuous token
 	callback func(entityID, continuousToken string)
+	// checked counts entities whose permission check completed successfully.
+	checked atomic.Int64
 }
 
 // executionState manages the execution of requests and maintains processing order.
@@ -308,15 +310,20 @@ func (bc *BulkChecker) ExecuteStreamingRequests(size uint32) error {
 		// Separate pre-computed from needs-check.
 		var entityIDs []string
 		var needCheckIndices []int
+		var precomputedCount int64
 		results := make([]base.CheckResult, len(chunk))
 
 		for i, req := range chunk {
 			if req.Result != base.CheckResult_CHECK_RESULT_UNSPECIFIED {
 				results[i] = req.Result
+				precomputedCount++
 			} else {
 				entityIDs = append(entityIDs, req.Request.GetEntity().GetId())
 				needCheckIndices = append(needCheckIndices, i)
 			}
+		}
+		if precomputedCount > 0 {
+			bc.checked.Add(precomputedCount)
 		}
 
 		// Batch check.
@@ -338,6 +345,7 @@ func (bc *BulkChecker) ExecuteStreamingRequests(size uint32) error {
 				}
 				return fmt.Errorf("streaming bulk execution failed: %w", err)
 			}
+			bc.checked.Add(int64(len(needCheckIndices)))
 
 			for j, idx := range needCheckIndices {
 				if result, ok := batchResp.Results[entityIDs[j]]; ok {
@@ -416,14 +424,19 @@ func (bc *BulkChecker) executeBatchEntity(requests []BulkCheckerRequest, size ui
 	// Separate pre-computed results from those needing a check.
 	var entityIDs []string
 	var needCheckIndices []int
+	var precomputedCount int64
 
 	for i, req := range requests {
 		if req.Result != base.CheckResult_CHECK_RESULT_UNSPECIFIED {
 			bc.executionState.results[i] = req.Result
+			precomputedCount++
 		} else {
 			entityIDs = append(entityIDs, req.Request.GetEntity().GetId())
 			needCheckIndices = append(needCheckIndices, i)
 		}
+	}
+	if precomputedCount > 0 {
+		bc.checked.Add(precomputedCount)
 	}
 
 	// Batch check all entities at once.
@@ -445,6 +458,7 @@ func (bc *BulkChecker) executeBatchEntity(requests []BulkCheckerRequest, size ui
 			}
 			return fmt.Errorf("bulk execution failed: %w", err)
 		}
+		bc.checked.Add(int64(len(needCheckIndices)))
 
 		for j, idx := range needCheckIndices {
 			if result, ok := batchResp.Results[entityIDs[j]]; ok {
@@ -566,6 +580,7 @@ func (bc *BulkChecker) processRequest(ctx context.Context, sem *semaphore.Weight
 func (bc *BulkChecker) getRequestResult(ctx context.Context, req BulkCheckerRequest) (base.CheckResult, error) {
 	// Use pre-computed result if available
 	if req.Result != base.CheckResult_CHECK_RESULT_UNSPECIFIED {
+		bc.checked.Add(1)
 		return req.Result, nil
 	}
 
@@ -574,8 +589,14 @@ func (bc *BulkChecker) getRequestResult(ctx context.Context, req BulkCheckerRequ
 	if err != nil {
 		return base.CheckResult_CHECK_RESULT_UNSPECIFIED, err
 	}
+	bc.checked.Add(1)
 
 	return response.UnionResult(), nil
+}
+
+// CheckedCount returns the number of entities whose permission check completed successfully.
+func (bc *BulkChecker) CheckedCount() int64 {
+	return bc.checked.Load()
 }
 
 // processResult processes a single result with thread-safe state updates.

@@ -26,7 +26,7 @@ import (
 )
 
 var (
-	databaseErrorHandlerCallsCounter = telemetry.NewCounter(internal.Meter, "database_error_handler_calls", "Number of errors mapped at error level by storage utils.HandleError, by error code")
+	databaseOperationalErrorsCounter = telemetry.NewCounter(internal.Meter, "database_error_handler_calls", "Number of errors processed by the storage error handler, by mapped error code")
 	errorCodeAttrs                   = func() map[base.ErrorCode]metric.MeasurementOption {
 		m := make(map[base.ErrorCode]metric.MeasurementOption, len(base.ErrorCode_name))
 		for code, name := range base.ErrorCode_name {
@@ -157,7 +157,7 @@ func HandleError(ctx context.Context, span trace.Span, err error, errorCode base
 	}
 
 	// For all other types of errors, log them at the error level and record them in the span
-	databaseErrorHandlerCallsCounter.Add(ctx, 1, errorCodeMeasurementOption(errorCode))
+	databaseOperationalErrorsCounter.Add(ctx, 1, errorCodeMeasurementOption(errorCode))
 	slog.ErrorContext(ctx, "An operational error occurred",
 		slog.Any("error", err))
 	span.RecordError(err)

@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
+	"github.com/jackc/pgx/v5/pgxpool"
 	slogmulti "github.com/samber/slog-multi" // Multi-handler logger
 	"github.com/sony/gobreaker"
 	"github.com/spf13/cobra"
@@ -372,7 +374,11 @@ func serve() func(cmd *cobra.Command, args []string) error {
 		defer engineKeyCache.Close()
 
 		if cfg.Meter.Enabled {
-			limitReg, err := registerLimitMetrics(internal.Meter, cfg)
+			var postgresDB *PQDatabase.Postgres
+			if pg, ok := db.(*PQDatabase.Postgres); ok {
+				postgresDB = pg
+			}
+			limitReg, err := registerLimitMetrics(internal.Meter, cfg, postgresDB)
 			if err != nil {
 				slog.Error(err.Error())
 				return err
@@ -412,6 +418,18 @@ func serve() func(cmd *cobra.Command, args []string) error {
 					slog.Error(err.Error())
 				}
 			}()
+			if postgresDB != nil {
+				if postgresDB.WritePool != nil {
+					if err = otelpgx.RecordStats(postgresDB.WritePool, otelpgx.WithStatsAttributes(attribute.String("pool", "write"))); err != nil {
+						return fmt.Errorf("failed to register write pool statistics: %w", err)
+					}
+				}
+				if postgresDB.ReadPool != nil {
+					if err = otelpgx.RecordStats(postgresDB.ReadPool, otelpgx.WithStatsAttributes(attribute.String("pool", "read"))); err != nil {
+						return fmt.Errorf("failed to register read pool statistics: %w", err)
+					}
+				}
+			}
 		}
 
 		watcher := storage.NewNoopWatcher()
@@ -612,12 +630,16 @@ func circuitBreakerStateChangeRecorder(meter otelmetric.Meter) func(name string,
 
 // registerLimitMetrics registers observable gauges for Permify's configured operational limits
 // so dashboards and alerts can compute saturation ratios without hardcoding configuration values.
-func registerLimitMetrics(meter otelmetric.Meter, cfg *config.Config) (otelmetric.Registration, error) {
+func registerLimitMetrics(meter otelmetric.Meter, cfg *config.Config, postgresDB *PQDatabase.Postgres) (otelmetric.Registration, error) {
+	type limitObservation struct {
+		value int64
+		opt   otelmetric.MeasurementOption
+	}
 	type limitGauge struct {
-		name        string
-		description string
-		value       int64
-		instrument  otelmetric.Int64ObservableGauge
+		name         string
+		description  string
+		observations []limitObservation
+		instrument   otelmetric.Int64ObservableGauge
 	}
 
 	maxConns := cfg.Database.MaxConnections
@@ -628,52 +650,72 @@ func registerLimitMetrics(meter otelmetric.Meter, cfg *config.Config) (otelmetri
 	if minConns <= 0 {
 		minConns = cfg.Database.MaxIdleConnections
 	}
+	maxConnsObservations := []limitObservation{{value: int64(maxConns)}}
+	minConnsObservations := []limitObservation{{value: int64(minConns)}}
+	if postgresDB != nil && postgresDB.WritePool != nil && postgresDB.ReadPool != nil {
+		maxConnsObservations = maxConnsObservations[:0]
+		minConnsObservations = minConnsObservations[:0]
+		for _, pool := range []struct {
+			name string
+			pool *pgxpool.Pool
+		}{{name: "write", pool: postgresDB.WritePool}, {name: "read", pool: postgresDB.ReadPool}} {
+			poolOpt := otelmetric.WithAttributeSet(attribute.NewSet(attribute.String("pool", pool.name)))
+			maxConnsObservations = append(maxConnsObservations, limitObservation{
+				value: int64(pool.pool.Stat().MaxConns()),
+				opt:   poolOpt,
+			})
+			minConnsObservations = append(minConnsObservations, limitObservation{
+				value: int64(pool.pool.Config().MinConns),
+				opt:   poolOpt,
+			})
+		}
+	}
 
 	gauges := []*limitGauge{
 		{
-			name:        "permission_bulk_limit",
-			description: "Configured maximum number of items per BulkCheck request and engine SQL batch",
-			value:       int64(cfg.Service.Permission.BulkLimit),
+			name:         "permission_bulk_limit",
+			description:  "Configured maximum number of items per BulkCheck request and engine SQL batch",
+			observations: []limitObservation{{value: int64(cfg.Service.Permission.BulkLimit)}},
 		},
 		{
-			name:        "permission_concurrency_limit",
-			description: "Configured concurrency limit per permission request",
-			value:       int64(cfg.Service.Permission.ConcurrencyLimit),
+			name:         "permission_concurrency_limit",
+			description:  "Configured concurrency limit per permission request",
+			observations: []limitObservation{{value: int64(cfg.Service.Permission.ConcurrencyLimit)}},
 		},
 		{
-			name:        "server_rate_limit",
-			description: "Configured maximum number of requests per second allowed by the server rate limiter",
-			value:       cfg.Server.RateLimit,
+			name:         "server_rate_limit",
+			description:  "Configured maximum number of requests per second allowed by the server rate limiter",
+			observations: []limitObservation{{value: cfg.Server.RateLimit}},
 		},
 		{
-			name:        "database_max_connections",
-			description: "Configured maximum number of connections in each database pool",
-			value:       int64(maxConns),
+			name:         "database_max_connections",
+			description:  "Effective maximum number of connections in the database pool",
+			observations: maxConnsObservations,
 		},
 		{
-			name:        "database_min_connections",
-			description: "Configured minimum number of connections in each database pool",
-			value:       int64(minConns),
+			name:         "database_min_connections",
+			description:  "Effective minimum number of connections in the database pool",
+			observations: minConnsObservations,
 		},
 		{
-			name:        "database_max_data_per_write",
-			description: "Configured maximum number of tuples and attributes per database write",
-			value:       int64(cfg.Database.MaxDataPerWrite),
+			name:         "database_max_data_per_write",
+			description:  "Configured maximum number of tuples and attributes per database write",
+			observations: []limitObservation{{value: int64(cfg.Database.MaxDataPerWrite)}},
 		},
 		{
-			name:        "database_max_retries",
-			description: "Configured maximum number of retries for serializable database transactions",
-			value:       int64(cfg.Database.MaxRetries),
+			name:         "database_max_retries",
+			description:  "Configured maximum number of retries for serializable database transactions",
+			observations: []limitObservation{{value: int64(cfg.Database.MaxRetries)}},
 		},
 		{
-			name:        "database_watch_buffer_size",
-			description: "Configured channel buffer size for Watch change events",
-			value:       int64(cfg.Database.WatchBufferSize),
+			name:         "database_watch_buffer_size",
+			description:  "Configured channel buffer size for Watch change events",
+			observations: []limitObservation{{value: int64(cfg.Database.WatchBufferSize)}},
 		},
 		{
-			name:        "authn_oidc_backoff_max_retries",
-			description: "Configured maximum number of OIDC JWKS fetch retries within a backoff interval",
-			value:       int64(cfg.Authn.Oidc.BackoffMaxRetries),
+			name:         "authn_oidc_backoff_max_retries",
+			description:  "Configured maximum number of OIDC JWKS fetch retries within a backoff interval",
+			observations: []limitObservation{{value: int64(cfg.Authn.Oidc.BackoffMaxRetries)}},
 		},
 	}
 
@@ -689,7 +731,13 @@ func registerLimitMetrics(meter otelmetric.Meter, cfg *config.Config) (otelmetri
 
 	return meter.RegisterCallback(func(_ context.Context, o otelmetric.Observer) error {
 		for _, g := range gauges {
-			o.ObserveInt64(g.instrument, g.value)
+			for _, obs := range g.observations {
+				if obs.opt != nil {
+					o.ObserveInt64(g.instrument, obs.value, obs.opt)
+				} else {
+					o.ObserveInt64(g.instrument, obs.value)
+				}
+			}
 		}
 		return nil
 	}, instruments...)

@@ -176,14 +176,43 @@ entity doc {
 	}
 	assert.Equal(t, map[string]int64{"miss": 1, "hit": 1}, lookupSchemaByResult)
 
-	// Verify lookup_entity_candidates and lookup_entity_matched
+	// Verify lookup_entity_candidates, lookup_entity_checked and lookup_entity_matched
 	candSum, ok := metrics["lookup_entity_candidates"].Data.(metricdata.Sum[int64])
 	require.True(t, ok)
 	require.Len(t, candSum.DataPoints, 1)
-	assert.Positive(t, candSum.DataPoints[0].Value)
+	assert.Equal(t, int64(4), candSum.DataPoints[0].Value)
+
+	checkedSum, ok := metrics["lookup_entity_checked"].Data.(metricdata.Sum[int64])
+	require.True(t, ok)
+	require.Len(t, checkedSum.DataPoints, 1)
+	assert.Equal(t, int64(4), checkedSum.DataPoints[0].Value)
 
 	matchedSum, ok := metrics["lookup_entity_matched"].Data.(metricdata.Sum[int64])
 	require.True(t, ok)
 	require.Len(t, matchedSum.DataPoints, 1)
 	assert.Equal(t, int64(4), matchedSum.DataPoints[0].Value)
+}
+
+func TestBulkCheckerCountsPrecomputedCandidatesAsChecked(t *testing.T) {
+	ctx := context.Background()
+	checker, err := NewBulkChecker(ctx, NewCheckEngine(nil, nil), BulkCheckerTypeEntity, func(string, string) {}, BulkCheckerConfig{
+		ConcurrencyLimit: 2,
+		BufferSize:       10,
+	})
+	require.NoError(t, err)
+	defer checker.Close()
+
+	publisher := NewBulkEntityPublisher(ctx, &base.PermissionLookupEntityRequest{
+		TenantId:   "t1",
+		EntityType: "doc",
+		Permission: "view",
+		Subject:    &base.Subject{Type: "user", Id: "alice"},
+		Metadata:   &base.PermissionLookupEntityRequestMetadata{},
+	}, checker)
+	publisher.Publish(&base.Entity{Type: "doc", Id: "1"}, &base.PermissionCheckRequestMetadata{}, nil, base.CheckResult_CHECK_RESULT_ALLOWED)
+	publisher.Publish(&base.Entity{Type: "doc", Id: "2"}, &base.PermissionCheckRequestMetadata{}, nil, base.CheckResult_CHECK_RESULT_DENIED)
+
+	require.NoError(t, checker.ExecuteRequests(10))
+	assert.Equal(t, int64(2), publisher.PublishedCount())
+	assert.Equal(t, int64(2), checker.CheckedCount())
 }

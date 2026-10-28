@@ -27,8 +27,10 @@ var (
 	checkBatchSplitAttrs  = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("engine", "check")))
 	expandBatchSplitAttrs = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("engine", "expand")))
 
-	checkConcurrencyWaitAttrs  = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("scope", "check")))
-	expandConcurrencyWaitAttrs = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("scope", "expand")))
+	checkConcurrencyWaitAttrs     = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("scope", "check")))
+	expandConcurrencyWaitAttrs    = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("scope", "expand")))
+	checkConcurrencyAttemptAttrs  = checkConcurrencyWaitAttrs
+	expandConcurrencyAttemptAttrs = expandConcurrencyWaitAttrs
 
 	celEvalOkAttrs    = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("result", "ok")))
 	celEvalErrorAttrs = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("result", "error")))

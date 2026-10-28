@@ -38,6 +38,7 @@ type LookupEngine struct {
 	meter                     metric.Meter
 	schemaCacheLookupsCounter metric.Int64Counter
 	candidatesCounter         metric.Int64Counter
+	checkedCounter            metric.Int64Counter
 	matchedCounter            metric.Int64Counter
 }
 
@@ -63,8 +64,9 @@ func NewLookupEngine(
 	}
 
 	engine.schemaCacheLookupsCounter = telemetry.NewCounter(engine.meter, "lookup_schema_cache_lookups", "Number of LookupEngine full-schema cache lookups, by result (hit or miss)")
-	engine.candidatesCounter = telemetry.NewCounter(engine.meter, "lookup_entity_candidates", "Number of candidate entities evaluated during LookupEntity and LookupEntityStream")
-	engine.matchedCounter = telemetry.NewCounter(engine.meter, "lookup_entity_matched", "Number of allowed entities matched during LookupEntity and LookupEntityStream")
+	engine.candidatesCounter = telemetry.NewCounter(engine.meter, "lookup_entity_candidates", "Number of candidate entities submitted to the bulk checker during LookupEntity and LookupEntityStream")
+	engine.checkedCounter = telemetry.NewCounter(engine.meter, "lookup_entity_checked", "Number of candidate entities whose permission check completed successfully during LookupEntity and LookupEntityStream")
+	engine.matchedCounter = telemetry.NewCounter(engine.meter, "lookup_entity_matched", "Number of allowed entities returned by LookupEntity and LookupEntityStream")
 
 	return engine
 }
@@ -105,10 +107,18 @@ func (engine *LookupEngine) LookupEntity(ctx context.Context, request *base.Perm
 	if err != nil {
 		return nil, fmt.Errorf("failed to create bulk checker: %w", err)
 	}
-	defer checker.Close()
 
 	// Create and start BulkPublisher. It receives entities and passes them to BulkChecker.
 	publisher := NewBulkEntityPublisher(ctx, request, checker)
+	defer func() {
+		checker.Close()
+		engine.candidatesCounter.Add(ctx, publisher.PublishedCount())
+		engine.checkedCounter.Add(ctx, checker.CheckedCount())
+		mu.Lock()
+		matched := int64(len(entityIDs))
+		mu.Unlock()
+		engine.matchedCounter.Add(ctx, matched)
+	}()
 
 	// Retrieve the schema of the entity based on the tenantId and schema version
 	var sc *base.SchemaDefinition
@@ -154,18 +164,16 @@ func (engine *LookupEngine) LookupEntity(ctx context.Context, request *base.Perm
 
 		err = checker.ExecuteStreamingRequests(size)
 		if err != nil {
+			checker.Close()
+			<-filterErrCh
 			return nil, err
 		}
 
-		// Check EntityFilter error — non-blocking since it may still be running
-		// (context was cancelled for early termination, EntityFilter will finish eventually).
-		select {
-		case filterErr := <-filterErrCh:
-			if filterErr != nil && !isContextError(filterErr) {
-				return nil, filterErr
-			}
-		default:
-			// EntityFilter still running — that's fine, it will exit via cancelled context.
+		// Wait for the producer to finish so candidate metrics include all work done
+		// before early termination or cancellation.
+		filterErr := <-filterErrCh
+		if filterErr != nil && !isContextError(filterErr) {
+			return nil, filterErr
 		}
 
 		ct = "<unordered>"
@@ -183,8 +191,6 @@ func (engine *LookupEngine) LookupEntity(ctx context.Context, request *base.Perm
 	}
 
 	// Return response containing allowed entity IDs
-	engine.candidatesCounter.Add(ctx, publisher.PublishedCount())
-	engine.matchedCounter.Add(ctx, int64(len(entityIDs)))
 	return &base.PermissionLookupEntityResponse{
 		EntityIds:       entityIDs,
 		ContinuousToken: ct,
@@ -204,7 +210,6 @@ func (engine *LookupEngine) LookupEntityStream(ctx context.Context, request *bas
 	// Define a callback function that will be called for each entity that passes the permission check.
 	// If the check result is allowed, it sends the entity ID to the server stream.
 	callback := func(entityID, token string) {
-		matchedCount.Add(1)
 		err := server.Send(&base.PermissionLookupEntityStreamResponse{
 			EntityId:        entityID,
 			ContinuousToken: token,
@@ -213,6 +218,7 @@ func (engine *LookupEngine) LookupEntityStream(ctx context.Context, request *bas
 		if err != nil {
 			return
 		}
+		matchedCount.Add(1)
 	}
 
 	// Create configuration for BulkChecker
@@ -226,10 +232,15 @@ func (engine *LookupEngine) LookupEntityStream(ctx context.Context, request *bas
 	if err != nil {
 		return fmt.Errorf("failed to create bulk checker: %w", err)
 	}
-	defer checker.Close()
 
 	// Create and start BulkPublisher. It receives entities and passes them to BulkChecker.
 	publisher := NewBulkEntityPublisher(ctx, request, checker)
+	defer func() {
+		checker.Close()
+		engine.candidatesCounter.Add(ctx, publisher.PublishedCount())
+		engine.checkedCounter.Add(ctx, checker.CheckedCount())
+		engine.matchedCounter.Add(ctx, matchedCount.Load())
+	}()
 
 	// Retrieve the entity definition schema based on the tenantId and schema version
 	var sc *base.SchemaDefinition
@@ -265,9 +276,6 @@ func (engine *LookupEngine) LookupEntityStream(ctx context.Context, request *bas
 	if err != nil {
 		return err
 	}
-
-	engine.candidatesCounter.Add(ctx, publisher.PublishedCount())
-	engine.matchedCounter.Add(ctx, matchedCount.Load())
 
 	return nil
 }

@@ -43,10 +43,10 @@ func TestSemaphoreDataReaderConcurrencyWaitsMetric(t *testing.T) {
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(context.Background(), &rm))
-	var waits int64
+	var waits, attempts int64
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			if m.Name != "concurrency_limit_waits" {
+			if m.Name != "concurrency_limit_waits" && m.Name != "concurrency_limit_acquire_attempts" {
 				continue
 			}
 			assert.Empty(t, m.Unit)
@@ -56,10 +56,26 @@ func TestSemaphoreDataReaderConcurrencyWaitsMetric(t *testing.T) {
 			for _, dp := range sum.DataPoints {
 				scope, _ := dp.Attributes.Value(attribute.Key("scope"))
 				if scope.AsString() == "storage" {
-					waits += dp.Value
+					if m.Name == "concurrency_limit_waits" {
+						waits += dp.Value
+					} else {
+						attempts += dp.Value
+					}
 				}
 			}
 		}
 	}
 	assert.Equal(t, int64(1), waits)
+	assert.Equal(t, int64(2), attempts)
+}
+
+func TestSemaphoreDataReaderPreservesPreCancelledContext(t *testing.T) {
+	sem := semaphore.NewWeighted(1)
+	ctx, cancel := context.WithCancel(invoke.WithConcurrencySemaphore(context.Background(), sem))
+	cancel()
+
+	dr := NewDataReader(storage.NewNoopRelationshipReader())
+	_, err := dr.acquire(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.True(t, sem.TryAcquire(1), "cancelled call must not consume the available semaphore slot")
 }

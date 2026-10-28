@@ -93,6 +93,11 @@ func (b *Balancer) recordSubConnEvent(attrs metric.MeasurementOption) {
 
 func (b *Balancer) ResolverError(err error) {
 	b.recordResolverUpdate(resolverErrorAttrs)
+	b.handleResolverError(err)
+}
+
+// handleResolverError applies a resolver failure to the balancer state without recording a resolver update result.
+func (b *Balancer) handleResolverError(err error) {
 	b.lastResolverError = err
 	if b.addressSubConns.Len() == 0 {
 		b.state = connectivity.TransientFailure
@@ -204,8 +209,7 @@ func (b *Balancer) UpdateClientConnState(s balancer.ClientConnState) error {
 
 	// Handle the case where the resolver produces zero addresses.
 	if len(s.ResolverState.Addresses) == 0 {
-		err := errors.New("resolver produced zero addresses")
-		b.ResolverError(err)
+		b.handleResolverError(errors.New("resolver produced zero addresses"))
 		b.recordResolverUpdate(resolverZeroAddressesAttrs)
 		slog.Error("Resolver produced zero addresses")
 		return balancer.ErrBadResolverState

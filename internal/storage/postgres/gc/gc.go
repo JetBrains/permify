@@ -107,16 +107,30 @@ func (gc *GC) Run() error {
 	}
 
 	// Process garbage collection for each tenant individually
+	return gc.runTenants(ctx, tenants, cutoffTime, gc.runForTenant)
+}
+
+func (gc *GC) runTenants(ctx context.Context, tenants []string, cutoffTime time.Time, runTenant func(context.Context, string, time.Time) error) error {
+	var tenantErrors []error
 	for _, tenantID := range tenants {
-		if err := gc.runForTenant(ctx, tenantID, cutoffTime); err != nil {
+		if err := runTenant(ctx, tenantID, cutoffTime); err != nil {
 			gc.tenantRunsCounter.Add(ctx, 1, gcErrorAttrs)
 			slog.Error("Garbage collection failed for tenant:", slog.String("tenant_id", tenantID), slog.Any("error", err))
 			// Continue with other tenants even if one fails
+			tenantErrors = append(tenantErrors, fmt.Errorf("garbage collection failed for tenant %s: %w", tenantID, err))
 			continue
 		}
 		gc.tenantRunsCounter.Add(ctx, 1, gcOkAttrs)
 	}
 
+	return gc.recordRunResult(ctx, tenantErrors)
+}
+
+func (gc *GC) recordRunResult(ctx context.Context, tenantErrors []error) error {
+	if err := errors.Join(tenantErrors...); err != nil {
+		gc.runsCounter.Add(ctx, 1, gcErrorAttrs)
+		return err
+	}
 	gc.runsCounter.Add(ctx, 1, gcOkAttrs)
 	return nil
 }

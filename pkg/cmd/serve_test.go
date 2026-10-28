@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sony/gobreaker"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/Permify/permify/internal/config"
+	PQDatabase "github.com/Permify/permify/pkg/database/postgres"
 )
 
 func TestCircuitBreakerStateChangeRecorder(t *testing.T) {
@@ -82,7 +84,7 @@ func TestRegisterLimitMetrics(t *testing.T) {
 	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 
 	cfg := config.DefaultConfig()
-	reg, err := registerLimitMetrics(meter, cfg)
+	reg, err := registerLimitMetrics(meter, cfg, nil)
 	require.NoError(t, err)
 	defer func() {
 		assert.NoError(t, reg.Unregister())
@@ -112,4 +114,49 @@ func TestRegisterLimitMetrics(t *testing.T) {
 		"database_watch_buffer_size":     int64(cfg.Database.WatchBufferSize),
 		"authn_oidc_backoff_max_retries": int64(cfg.Authn.Oidc.BackoffMaxRetries),
 	}, got)
+}
+
+func TestRegisterLimitMetricsUsesEffectivePoolSettings(t *testing.T) {
+	newPool := func(uri string) *pgxpool.Pool {
+		cfg, err := pgxpool.ParseConfig(uri)
+		require.NoError(t, err)
+		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+		require.NoError(t, err)
+		t.Cleanup(pool.Close)
+		return pool
+	}
+
+	reader := sdkmetric.NewManualReader()
+	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+	cfg := config.DefaultConfig()
+	postgresDB := &PQDatabase.Postgres{
+		WritePool: newPool("postgres://user:pass@127.0.0.1:1/permify?pool_max_conns=7&pool_min_conns=2"),
+		ReadPool:  newPool("postgres://user:pass@127.0.0.1:1/permify?pool_max_conns=11&pool_min_conns=3"),
+	}
+	reg, err := registerLimitMetrics(meter, cfg, postgresDB)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, reg.Unregister()) }()
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	got := map[string]map[string]int64{}
+	for _, scope := range rm.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			if metric.Name != "database_max_connections" && metric.Name != "database_min_connections" {
+				continue
+			}
+			gauge, ok := metric.Data.(metricdata.Gauge[int64])
+			require.True(t, ok)
+			for _, point := range gauge.DataPoints {
+				pool, ok := point.Attributes.Value(attribute.Key("pool"))
+				require.True(t, ok)
+				if got[metric.Name] == nil {
+					got[metric.Name] = make(map[string]int64)
+				}
+				got[metric.Name][pool.AsString()] = point.Value
+			}
+		}
+	}
+	assert.Equal(t, map[string]int64{"read": 11, "write": 7}, got["database_max_connections"])
+	assert.Equal(t, map[string]int64{"read": 3, "write": 2}, got["database_min_connections"])
 }

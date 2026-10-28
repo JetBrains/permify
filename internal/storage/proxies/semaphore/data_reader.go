@@ -16,7 +16,10 @@ import (
 	"github.com/Permify/permify/pkg/token"
 )
 
-var storageWaitAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("scope", "storage")))
+var (
+	storageWaitAttrs    = metric.WithAttributeSet(attribute.NewSet(attribute.String("scope", "storage")))
+	storageAttemptAttrs = storageWaitAttrs
+)
 
 // Option - Option type for the semaphore DataReader
 type Option func(*options)
@@ -36,8 +39,9 @@ func WithMeter(meter metric.Meter) Option {
 // Each DB query acquires a slot from the request-scoped semaphore (stored in context),
 // preventing connection pool exhaustion from concurrent goroutines.
 type DataReader struct {
-	delegate                storage.DataReader
-	concurrencyWaitsCounter metric.Int64Counter
+	delegate                   storage.DataReader
+	concurrencyWaitsCounter    metric.Int64Counter
+	concurrencyAttemptsCounter metric.Int64Counter
 }
 
 // NewDataReader creates a semaphore-protected DataReader.
@@ -47,18 +51,28 @@ func NewDataReader(delegate storage.DataReader, opts ...Option) *DataReader {
 		opt(o)
 	}
 	return &DataReader{
-		delegate:                delegate,
-		concurrencyWaitsCounter: telemetry.NewCounter(o.meter, "concurrency_limit_waits", "Number of times a request had to wait for a concurrency limit slot, by scope"),
+		delegate:                   delegate,
+		concurrencyWaitsCounter:    telemetry.NewCounter(o.meter, "concurrency_limit_waits", "Number of times a request had to wait for a concurrency limit slot, by scope"),
+		concurrencyAttemptsCounter: telemetry.NewCounter(o.meter, "concurrency_limit_acquire_attempts", "Number of attempts to acquire a request concurrency slot, by scope"),
 	}
 }
 
 func (r *DataReader) acquire(ctx context.Context) (*semaphore.Weighted, error) {
 	sem := invoke.ConcurrencySemaphoreFromContext(ctx)
-	if !sem.TryAcquire(1) {
-		r.concurrencyWaitsCounter.Add(ctx, 1, storageWaitAttrs)
-		if err := sem.Acquire(ctx, 1); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.concurrencyAttemptsCounter.Add(ctx, 1, storageAttemptAttrs)
+	if sem.TryAcquire(1) {
+		if err := ctx.Err(); err != nil {
+			sem.Release(1)
 			return nil, err
 		}
+		return sem, nil
+	}
+	r.concurrencyWaitsCounter.Add(ctx, 1, storageWaitAttrs)
+	if err := sem.Acquire(ctx, 1); err != nil {
+		return nil, err
 	}
 	return sem, nil
 }

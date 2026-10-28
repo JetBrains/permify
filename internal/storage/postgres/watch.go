@@ -351,6 +351,10 @@ func (w *Watch) getChanges(ctx context.Context, value db.XID8, tenantID string) 
 			},
 		})
 	}
+	if err := trows.Err(); err != nil {
+		slog.ErrorContext(ctx, "failed while reading relation tuple rows", slog.Any("error", err))
+		return nil, err
+	}
 
 	// Iterate through the result rows.
 	for arows.Next() {
@@ -388,6 +392,10 @@ func (w *Watch) getChanges(ctx context.Context, value db.XID8, tenantID string) 
 				Attribute: rt.ToAttribute(),
 			},
 		})
+	}
+	if err := arows.Err(); err != nil {
+		slog.ErrorContext(ctx, "failed while reading attribute rows", slog.Any("error", err))
+		return nil, err
 	}
 
 	slog.DebugContext(ctx, "successfully retrieved changes for transaction", slog.Any("id", value))
