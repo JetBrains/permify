@@ -15,6 +15,8 @@ import (
 	"github.com/sony/gobreaker"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/Permify/permify/internal/engines/balancer"
@@ -436,6 +438,7 @@ func serve() func(cmd *cobra.Command, args []string) error {
 				failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
 				return counts.Requests >= 10 && failureRatio >= 0.6
 			}
+			st.OnStateChange = circuitBreakerStateChangeRecorder(internal.Meter)
 
 			cb = gobreaker.NewCircuitBreaker(st)
 
@@ -582,6 +585,19 @@ func serve() func(cmd *cobra.Command, args []string) error {
 		}
 
 		return nil
+	}
+}
+
+// circuitBreakerStateChangeRecorder returns a gobreaker OnStateChange callback that counts the state changes
+// of the circuit breaker by breaker name, previous state and new state ("closed", "half-open" or "open").
+func circuitBreakerStateChangeRecorder(meter otelmetric.Meter) func(name string, from, to gobreaker.State) {
+	counter := telemetry.NewCounter(meter, "circuit_breaker_state_changes", "Number of circuit breaker state changes, by breaker name, previous state and new state")
+	return func(name string, from, to gobreaker.State) {
+		counter.Add(context.Background(), 1, otelmetric.WithAttributes(
+			attribute.String("name", name),
+			attribute.String("from", from.String()),
+			attribute.String("to", to.String()),
+		))
 	}
 }
 

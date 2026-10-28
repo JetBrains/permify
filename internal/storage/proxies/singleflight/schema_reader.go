@@ -19,11 +19,12 @@ type headVersionResult struct {
 type SchemaReader struct {
 	delegate storage.SchemaReader
 	group    singleflight.Group[string, headVersionResult]
+	metrics  metrics
 }
 
 // NewSchemaReader - Add singleflight behaviour to new schema reader
-func NewSchemaReader(delegate storage.SchemaReader) *SchemaReader {
-	return &SchemaReader{delegate: delegate}
+func NewSchemaReader(delegate storage.SchemaReader, opts ...Option) *SchemaReader {
+	return &SchemaReader{delegate: delegate, metrics: newMetrics(opts...)}
 }
 
 // ReadSchema returns the schema definition for a specific tenant and version as a structured object.
@@ -48,7 +49,9 @@ func (r *SchemaReader) ReadRuleDefinition(ctx context.Context, tenantID, sharedS
 
 // HeadVersion - Finds the latest version of the schema.
 func (r *SchemaReader) HeadVersion(ctx context.Context, tenantID string) (string, string, error) {
+	r.metrics.calls.Add(ctx, 1, headVersionAttrs)
 	res, _, err := r.group.Do(ctx, tenantID, func(ctx context.Context) (headVersionResult, error) {
+		r.metrics.executions.Add(ctx, 1, headVersionAttrs)
 		sharedSchemaID, version, err := r.delegate.HeadVersion(ctx, tenantID)
 		return headVersionResult{version: version, sharedSchemaID: sharedSchemaID}, err
 	})

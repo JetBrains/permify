@@ -21,17 +21,20 @@ type DataReader struct {
 	queryRelWithSubjectPushdownGroup singleflight.Group[string, []*base.Tuple]
 	querySingleAttrGroup             singleflight.Group[string, *base.Attribute]
 	queryAttributesGroup             singleflight.Group[string, []*base.Attribute]
+	metrics                          metrics
 }
 
 // NewDataReader - Add singleflight behaviour to new data reader
-func NewDataReader(delegate storage.DataReader) *DataReader {
-	return &DataReader{delegate: delegate}
+func NewDataReader(delegate storage.DataReader, opts ...Option) *DataReader {
+	return &DataReader{delegate: delegate, metrics: newMetrics(opts...)}
 }
 
 // QueryRelationships - Reads relation tuples from the repository with singleflight deduplication.
 func (r *DataReader) QueryRelationships(ctx context.Context, tenantID string, filter *base.TupleFilter, token string, pagination database.CursorPagination) (*database.TupleIterator, error) {
 	key := queryRelationshipsKey(tenantID, filter, token, pagination)
+	r.metrics.calls.Add(ctx, 1, queryRelationshipsAttrs)
 	tuples, _, err := r.queryRelationshipsGroup.Do(ctx, key, func(ctx context.Context) ([]*base.Tuple, error) {
+		r.metrics.executions.Add(ctx, 1, queryRelationshipsAttrs)
 		it, err := r.delegate.QueryRelationships(ctx, tenantID, filter, token, pagination)
 		if err != nil {
 			return nil, err
@@ -47,7 +50,9 @@ func (r *DataReader) QueryRelationships(ctx context.Context, tenantID string, fi
 // QueryRelationshipsWithSubjectFilter - Reads relation tuples with subject push-down, with singleflight deduplication.
 func (r *DataReader) QueryRelationshipsWithSubjectFilter(ctx context.Context, tenantID string, filter *base.TupleFilter, subject *base.Subject, token string, pagination database.CursorPagination) (*database.TupleIterator, error) {
 	key := queryRelationshipsWithSubjectKey(tenantID, filter, subject, token, pagination)
+	r.metrics.calls.Add(ctx, 1, queryRelationshipsWithSubjectFilterAttrs)
 	tuples, _, err := r.queryRelWithSubjectPushdownGroup.Do(ctx, key, func(ctx context.Context) ([]*base.Tuple, error) {
+		r.metrics.executions.Add(ctx, 1, queryRelationshipsWithSubjectFilterAttrs)
 		it, err := r.delegate.QueryRelationshipsWithSubjectFilter(ctx, tenantID, filter, subject, token, pagination)
 		if err != nil {
 			return nil, err
@@ -68,7 +73,9 @@ func (r *DataReader) ReadRelationships(ctx context.Context, tenantID string, fil
 // QuerySingleAttribute - Reads a single attribute from the repository with singleflight deduplication.
 func (r *DataReader) QuerySingleAttribute(ctx context.Context, tenantID string, filter *base.AttributeFilter, token string) (*base.Attribute, error) {
 	key := querySingleAttributeKey(tenantID, filter, token)
+	r.metrics.calls.Add(ctx, 1, querySingleAttributeAttrs)
 	attr, _, err := r.querySingleAttrGroup.Do(ctx, key, func(ctx context.Context) (*base.Attribute, error) {
+		r.metrics.executions.Add(ctx, 1, querySingleAttributeAttrs)
 		return r.delegate.QuerySingleAttribute(ctx, tenantID, filter, token)
 	})
 	return attr, err
@@ -77,7 +84,9 @@ func (r *DataReader) QuerySingleAttribute(ctx context.Context, tenantID string, 
 // QueryAttributes - Reads multiple attributes from the repository with singleflight deduplication.
 func (r *DataReader) QueryAttributes(ctx context.Context, tenantID string, filter *base.AttributeFilter, token string, pagination database.CursorPagination) (*database.AttributeIterator, error) {
 	key := queryAttributesKey(tenantID, filter, token, pagination)
+	r.metrics.calls.Add(ctx, 1, queryAttributesAttrs)
 	attrs, _, err := r.queryAttributesGroup.Do(ctx, key, func(ctx context.Context) ([]*base.Attribute, error) {
+		r.metrics.executions.Add(ctx, 1, queryAttributesAttrs)
 		it, err := r.delegate.QueryAttributes(ctx, tenantID, filter, token, pagination)
 		if err != nil {
 			return nil, err
@@ -102,7 +111,9 @@ func (r *DataReader) QueryUniqueSubjectReferences(ctx context.Context, tenantID 
 
 // HeadSnapshot - Reads the latest version of the snapshot from the repository.
 func (r *DataReader) HeadSnapshot(ctx context.Context, tenantID string) (token.SnapToken, error) {
+	r.metrics.calls.Add(ctx, 1, headSnapshotAttrs)
 	rev, _, err := r.headSnapshotGroup.Do(ctx, tenantID, func(ctx context.Context) (token.SnapToken, error) {
+		r.metrics.executions.Add(ctx, 1, headSnapshotAttrs)
 		return r.delegate.HeadSnapshot(ctx, tenantID)
 	})
 	return rev, err

@@ -7,19 +7,41 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	grpcbalancer "google.golang.org/grpc/balancer"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/Permify/permify/internal"
 	"github.com/Permify/permify/internal/config"
 	"github.com/Permify/permify/internal/engines"
 	"github.com/Permify/permify/internal/invoke"
 	"github.com/Permify/permify/internal/storage"
 	"github.com/Permify/permify/pkg/balancer"
 	base "github.com/Permify/permify/pkg/pb/base/v1"
+	"github.com/Permify/permify/pkg/telemetry"
 )
+
+// Attribute sets of the balancer counters. They are created once, because Check is on the hot path.
+var (
+	pickerNotReadyAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("reason", "picker_not_ready")))
+	pickFailedAttrs     = metric.WithAttributeSet(attribute.NewSet(attribute.String("reason", "pick_failed")))
+
+	checkOkAttrs        = remoteCallAttrs("check", "ok")
+	checkErrorAttrs     = remoteCallAttrs("check", "error")
+	bulkCheckOkAttrs    = remoteCallAttrs("bulk_check", "ok")
+	bulkCheckErrorAttrs = remoteCallAttrs("bulk_check", "error")
+)
+
+func remoteCallAttrs(rpc, result string) metric.MeasurementOption {
+	return metric.WithAttributeSet(attribute.NewSet(
+		attribute.String("rpc", rpc),
+		attribute.String("result", result),
+	))
+}
 
 // Balancer wraps permission checking with consistent-hash load balancing.
 // All requests (single and batch) are distributed across nodes via the consistent
@@ -29,6 +51,32 @@ type Balancer struct {
 	checker      invoke.Check
 	client       base.PermissionClient
 	builder      balancer.Builder
+
+	// Metrics
+	fallbacksCounter   metric.Int64Counter
+	remoteCallsCounter metric.Int64Counter
+}
+
+// Option - Option type for Balancer
+type Option func(*balancerOptions)
+
+type balancerOptions struct {
+	meter  metric.Meter
+	client base.PermissionClient
+}
+
+// WithMeter - Sets the meter used to create the balancer metrics. The default is internal.Meter.
+func WithMeter(meter metric.Meter) Option {
+	return func(o *balancerOptions) {
+		o.meter = meter
+	}
+}
+
+// WithClient - Sets the gRPC PermissionClient used by the balancer. When not provided, a new client is dialed.
+func WithClient(client base.PermissionClient) Option {
+	return func(o *balancerOptions) {
+		o.client = client
+	}
 }
 
 // NewCheckEngineWithBalancer creates a new check engine with a load balancer.
@@ -43,67 +91,80 @@ func NewCheckEngineWithBalancer(
 	dst *config.Distributed,
 	srv *config.GRPC,
 	authn *config.Authn,
+	opts ...Option,
 ) (invoke.Check, error) {
-	var (
-		creds    credentials.TransportCredentials
-		options  []grpc.DialOption
-		isSecure bool
-		err      error
-	)
+	o := &balancerOptions{meter: internal.Meter}
+	for _, opt := range opts {
+		opt(o)
+	}
 
-	// Set up TLS credentials if paths are provided
-	if srv.TLSConfig.Enabled && srv.TLSConfig.CertPath != "" {
-		isSecure = true
-		creds, err = credentials.NewClientTLSFromFile(srv.TLSConfig.CertPath, no)
-		if err != nil {
-			return nil, fmt.Errorf("could not load TLS certificate: %w", err)
+	client := o.client
+	if client == nil {
+		var (
+			creds    credentials.TransportCredentials
+			options  []grpc.DialOption
+			isSecure bool
+			err      error
+		)
+
+		// Set up TLS credentials if paths are provided
+		if srv.TLSConfig.Enabled && srv.TLSConfig.CertPath != "" {
+			isSecure = true
+			creds, err = credentials.NewClientTLSFromFile(srv.TLSConfig.CertPath, no)
+			if err != nil {
+				return nil, fmt.Errorf("could not load TLS certificate: %w", err)
+			}
+		} else {
+			creds = insecure.NewCredentials()
 		}
-	} else {
-		creds = insecure.NewCredentials()
-	}
 
-	bc := &balancer.Config{
-		PartitionCount:    dst.PartitionCount,
-		ReplicationFactor: dst.ReplicationFactor,
-		Load:              dst.Load,
-		PickerWidth:       dst.PickerWidth,
-	}
+		bc := &balancer.Config{
+			PartitionCount:    dst.PartitionCount,
+			ReplicationFactor: dst.ReplicationFactor,
+			Load:              dst.Load,
+			PickerWidth:       dst.PickerWidth,
+		}
 
-	bcjson, err := bc.ServiceConfigJSON()
-	if err != nil {
-		return nil, err
-	}
-
-	// Append common options
-	options = append(
-		options,
-		grpc.WithDefaultServiceConfig(bcjson),
-		grpc.WithTransportCredentials(creds),
-	)
-
-	// Handle authentication if enabled
-	if authn != nil && authn.Enabled {
-		token, err := setupAuthn(ctx, authn)
+		bcjson, err := bc.ServiceConfigJSON()
 		if err != nil {
 			return nil, err
 		}
-		if isSecure {
-			options = append(options, grpc.WithPerRPCCredentials(secureTokenCredentials{"authorization": "Bearer " + token}))
-		} else {
-			options = append(options, grpc.WithPerRPCCredentials(nonSecureTokenCredentials{"authorization": "Bearer " + token}))
-		}
-	}
 
-	conn, err := grpc.NewClient(dst.Address, options...)
-	if err != nil {
-		return nil, err
+		// Append common options
+		options = append(
+			options,
+			grpc.WithDefaultServiceConfig(bcjson),
+			grpc.WithTransportCredentials(creds),
+		)
+
+		// Handle authentication if enabled
+		if authn != nil && authn.Enabled {
+			token, err := setupAuthn(ctx, authn)
+			if err != nil {
+				return nil, err
+			}
+			if isSecure {
+				options = append(options, grpc.WithPerRPCCredentials(secureTokenCredentials{"authorization": "Bearer " + token}))
+			} else {
+				options = append(options, grpc.WithPerRPCCredentials(nonSecureTokenCredentials{"authorization": "Bearer " + token}))
+			}
+		}
+
+		conn, err := grpc.NewClient(dst.Address, options...)
+		if err != nil {
+			return nil, err
+		}
+		client = base.NewPermissionClient(conn)
 	}
 
 	return &Balancer{
 		schemaReader: schemaReader,
 		checker:      checker,
-		client:       base.NewPermissionClient(conn),
+		client:       client,
 		builder:      builder,
+
+		fallbacksCounter:   telemetry.NewCounter(o.meter, "balancer_fallbacks", "Number of checks that the balancer ran locally instead of on a remote node, by reason"),
+		remoteCallsCounter: telemetry.NewCounter(o.meter, "balancer_remote_calls", "Number of RPCs that the balancer sent to cluster nodes, by rpc and result"),
 	}, nil
 }
 
@@ -115,6 +176,7 @@ func (c *Balancer) Check(ctx context.Context, request *invoke.BatchCheckRequest)
 	nodePicker := c.builder.Picker()
 	if nodePicker == nil {
 		slog.ErrorContext(ctx, "Pick failed, falling back to local", "error", "picker not ready")
+		c.fallbacksCounter.Add(ctx, 1, pickerNotReadyAttrs)
 		return c.checker.Check(ctx, request)
 	}
 
@@ -138,6 +200,7 @@ func (c *Balancer) Check(ctx context.Context, request *invoke.BatchCheckRequest)
 		sc, err := nodePicker.Pick(key)
 		if err != nil {
 			slog.ErrorContext(ctx, "Pick failed, falling back to local", "error", err.Error())
+			c.fallbacksCounter.Add(ctx, 1, pickFailedAttrs)
 			return c.checker.Check(ctx, request)
 		}
 		groups[sc] = append(groups[sc], entityID)
@@ -165,9 +228,11 @@ func (c *Balancer) Check(ctx context.Context, request *invoke.BatchCheckRequest)
 				protoReq := request.ToPermissionCheckRequest(entityIDs[0])
 				response, err := c.client.Check(withTimeout, protoReq)
 				if err != nil {
+					c.remoteCallsCounter.Add(ctx, 1, checkErrorAttrs)
 					results[idx] = groupResult{err: err}
 					return
 				}
+				c.remoteCallsCounter.Add(ctx, 1, checkOkAttrs)
 				results[idx] = groupResult{resp: &invoke.BatchCheckResponse{
 					Results:  map[string]base.CheckResult{entityIDs[0]: response.GetCan()},
 					Metadata: response.GetMetadata(),
@@ -191,9 +256,11 @@ func (c *Balancer) Check(ctx context.Context, request *invoke.BatchCheckRequest)
 				}
 				bulkResp, err := c.client.BulkCheck(withTimeout, bulkReq)
 				if err != nil {
+					c.remoteCallsCounter.Add(ctx, 1, bulkCheckErrorAttrs)
 					results[idx] = groupResult{err: err}
 					return
 				}
+				c.remoteCallsCounter.Add(ctx, 1, bulkCheckOkAttrs)
 				// Map BulkCheck results back by entity ID (results are ordered same as items).
 				resp := &invoke.BatchCheckResponse{
 					Results:  make(map[string]base.CheckResult, len(entityIDs)),
