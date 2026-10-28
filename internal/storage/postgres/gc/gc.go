@@ -9,10 +9,19 @@ import (
 	"time"
 
 	"github.com/Masterminds/squirrel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
+	"github.com/Permify/permify/internal"
 	"github.com/Permify/permify/internal/storage/postgres"
 	"github.com/Permify/permify/internal/storage/postgres/utils"
 	db "github.com/Permify/permify/pkg/database/postgres"
+	"github.com/Permify/permify/pkg/telemetry"
+)
+
+var (
+	gcOkAttrs    = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "ok")))
+	gcErrorAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "error")))
 )
 
 // GC represents a Garbage Collector configuration for database cleanup.
@@ -25,6 +34,10 @@ type GC struct {
 	window time.Duration
 	// timeout is the maximum time allowed for a single GC run.
 	timeout time.Duration
+
+	meter             metric.Meter
+	runsCounter       metric.Int64Counter
+	tenantRunsCounter metric.Int64Counter
 }
 
 // NewGC creates a new GC instance with the provided configuration.
@@ -34,12 +47,16 @@ func NewGC(db *db.Postgres, opts ...Option) *GC {
 		window:   _defaultWindow,
 		timeout:  _defaultTimeout,
 		database: db,
+		meter:    internal.Meter,
 	}
 
 	// Custom options
 	for _, opt := range opts {
 		opt(gc)
 	}
+
+	gc.runsCounter = telemetry.NewCounter(gc.meter, "gc_runs", "Number of database garbage collection cycles, by result (ok or error)")
+	gc.tenantRunsCounter = telemetry.NewCounter(gc.meter, "gc_tenant_runs", "Number of per-tenant database garbage collection executions, by result (ok or error)")
 
 	return gc
 }
@@ -73,6 +90,7 @@ func (gc *GC) Run() error {
 	var dbNow time.Time
 	err := gc.database.WritePool.QueryRow(ctx, "SELECT NOW() AT TIME ZONE 'UTC'").Scan(&dbNow)
 	if err != nil {
+		gc.runsCounter.Add(ctx, 1, gcErrorAttrs)
 		slog.Error("Failed to get current time from database", slog.Any("error", err))
 		return err
 	}
@@ -83,6 +101,7 @@ func (gc *GC) Run() error {
 	// Get all tenants for tenant-specific garbage collection
 	tenants, err := gc.getAllTenants(ctx)
 	if err != nil {
+		gc.runsCounter.Add(ctx, 1, gcErrorAttrs)
 		slog.Error("Failed to retrieve tenants:", slog.Any("error", err))
 		return err
 	}
@@ -90,12 +109,15 @@ func (gc *GC) Run() error {
 	// Process garbage collection for each tenant individually
 	for _, tenantID := range tenants {
 		if err := gc.runForTenant(ctx, tenantID, cutoffTime); err != nil {
+			gc.tenantRunsCounter.Add(ctx, 1, gcErrorAttrs)
 			slog.Error("Garbage collection failed for tenant:", slog.String("tenant_id", tenantID), slog.Any("error", err))
 			// Continue with other tenants even if one fails
 			continue
 		}
+		gc.tenantRunsCounter.Add(ctx, 1, gcOkAttrs)
 	}
 
+	gc.runsCounter.Add(ctx, 1, gcOkAttrs)
 	return nil
 }
 

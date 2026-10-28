@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/rs/xid"
+	"go.opentelemetry.io/otel/attribute"
 	api "go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/status"
 
@@ -20,6 +21,13 @@ import (
 	"github.com/Permify/permify/pkg/telemetry"
 )
 
+var (
+	writeSchemaErrAttrs        = api.WithAttributeSet(attribute.NewSet(attribute.String("op", "write_schema")))
+	partialWriteSchemaErrAttrs = api.WithAttributeSet(attribute.NewSet(attribute.String("op", "partial_write_schema")))
+	readSchemaErrAttrs         = api.WithAttributeSet(attribute.NewSet(attribute.String("op", "read_schema")))
+	listSchemaErrAttrs         = api.WithAttributeSet(attribute.NewSet(attribute.String("op", "list_schema")))
+)
+
 // SchemaServer - Structure for Schema Server
 type SchemaServer struct {
 	v1.UnimplementedSchemaServer
@@ -29,6 +37,7 @@ type SchemaServer struct {
 	writeSchemaCounter api.Int64Counter
 	readSchemaCounter  api.Int64Counter
 	listSchemaCounter  api.Int64Counter
+	errorsCounter      api.Int64Counter
 }
 
 // NewSchemaServer - Creates new Schema Server
@@ -39,6 +48,7 @@ func NewSchemaServer(sw storage.SchemaWriter, sr storage.SchemaReader) *SchemaSe
 		writeSchemaCounter: telemetry.NewCounter(internal.Meter, "write_schema", "Number of writing schema"),
 		readSchemaCounter:  telemetry.NewCounter(internal.Meter, "read_schema", "Number of reading schema"),
 		listSchemaCounter:  telemetry.NewCounter(internal.Meter, "list_schema", "Number of listing schema"),
+		errorsCounter:      telemetry.NewCounter(internal.Meter, "schema_server_errors", "Number of failed SchemaServer RPC calls, by operation"),
 	}
 }
 
@@ -49,6 +59,7 @@ func (r *SchemaServer) Write(ctx context.Context, request *v1.SchemaWriteRequest
 
 	sch, err := parser.NewParser(request.GetSchema()).Parse()
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, writeSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		return nil, status.Error(GetStatus(err), err.Error()) // Return parse error
@@ -56,6 +67,7 @@ func (r *SchemaServer) Write(ctx context.Context, request *v1.SchemaWriteRequest
 
 	_, _, err = compiler.NewCompiler(true, sch).Compile()
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, writeSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		return nil, status.Error(GetStatus(err), err.Error()) // Return compile error
@@ -75,6 +87,7 @@ func (r *SchemaServer) Write(ctx context.Context, request *v1.SchemaWriteRequest
 
 	err = r.sw.WriteSchema(ctx, cnf)
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, writeSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -102,6 +115,7 @@ func (r *SchemaServer) PartialWrite(ctx context.Context, request *v1.SchemaParti
 		var err error
 		sharedSchemaID, ver, err = r.sr.HeadVersion(ctx, request.GetTenantId())
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 			return nil, status.Error(GetStatus(err), err.Error()) // Return version error
 		}
 		version = ver
@@ -110,6 +124,7 @@ func (r *SchemaServer) PartialWrite(ctx context.Context, request *v1.SchemaParti
 	// Fetch the current schema definition as a string.
 	definitions, err := r.sr.ReadSchemaString(ctx, request.GetTenantId(), sharedSchemaID, version)
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 		span.RecordError(err) // Log and record the error.
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
@@ -118,6 +133,7 @@ func (r *SchemaServer) PartialWrite(ctx context.Context, request *v1.SchemaParti
 	p := parser.NewParser(strings.Join(definitions, "\n"))
 	schema, err := p.Parse()
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 		span.RecordError(err) // Log and record the error.
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
@@ -128,11 +144,13 @@ func (r *SchemaServer) PartialWrite(ctx context.Context, request *v1.SchemaParti
 			pr := parser.NewParser(write)
 			stmt, err := pr.ParsePartial(entityName)
 			if err != nil {
+				r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 				span.RecordError(err)
 				return nil, status.Error(GetStatus(err), err.Error())
 			}
 			err = schema.AddStatement(entityName, stmt)
 			if err != nil {
+				r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 				span.RecordError(err)
 				return nil, status.Error(GetStatus(err), err.Error())
 			}
@@ -142,11 +160,13 @@ func (r *SchemaServer) PartialWrite(ctx context.Context, request *v1.SchemaParti
 			pr := parser.NewParser(update)
 			stmt, err := pr.ParsePartial(entityName)
 			if err != nil {
+				r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 				span.RecordError(err)
 				return nil, status.Error(GetStatus(err), err.Error())
 			}
 			err = schema.UpdateStatement(entityName, stmt)
 			if err != nil {
+				r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 				span.RecordError(err)
 				return nil, status.Error(GetStatus(err), err.Error())
 			}
@@ -155,6 +175,7 @@ func (r *SchemaServer) PartialWrite(ctx context.Context, request *v1.SchemaParti
 		for _, del := range partials.GetDelete() { // Handle schema deletions.
 			err = schema.DeleteStatement(entityName, del)
 			if err != nil {
+				r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 				span.RecordError(err)
 				return nil, status.Error(GetStatus(err), err.Error())
 			}
@@ -164,6 +185,7 @@ func (r *SchemaServer) PartialWrite(ctx context.Context, request *v1.SchemaParti
 	// Re-parse the updated schema to ensure consistency.
 	sch, err := parser.NewParser(schema.String()).Parse()
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 		span.RecordError(err)
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
@@ -171,6 +193,7 @@ func (r *SchemaServer) PartialWrite(ctx context.Context, request *v1.SchemaParti
 	// Compile the new schema to validate its correctness.
 	_, _, err = compiler.NewCompiler(true, sch).Compile()
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 		span.RecordError(err)
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
@@ -192,9 +215,12 @@ func (r *SchemaServer) PartialWrite(ctx context.Context, request *v1.SchemaParti
 	// Write the updated schema to storage.
 	err = r.sw.WriteSchema(ctx, cnf)
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, partialWriteSchemaErrAttrs)
 		span.RecordError(err)
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
+
+	r.writeSchemaCounter.Add(ctx, 1)
 
 	// Return the response with the new schema version.
 	return &v1.SchemaPartialWriteResponse{
@@ -213,12 +239,14 @@ func (r *SchemaServer) Read(ctx context.Context, request *v1.SchemaReadRequest) 
 		var err error
 		sharedSchemaID, version, err = r.sr.HeadVersion(ctx, request.GetTenantId())
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, readSchemaErrAttrs)
 			return nil, status.Error(GetStatus(err), err.Error()) // Return version error
 		}
 	}
 
 	response, err := r.sr.ReadSchema(ctx, request.GetTenantId(), sharedSchemaID, version)
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, readSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -240,12 +268,14 @@ func (r *SchemaServer) List(ctx context.Context, request *v1.SchemaListRequest) 
 	// Get the latest version and shared schema ID
 	sharedSchemaID, head, err := r.sr.HeadVersion(ctx, request.GetTenantId())
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, listSchemaErrAttrs)
 		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
 	// Fetch schemas with pagination
 	schemas, ct, err := r.sr.ListSchemas(ctx, request.GetTenantId(), sharedSchemaID, database.NewPagination(database.Size(request.GetPageSize()), database.Token(request.GetContinuousToken())))
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, listSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())

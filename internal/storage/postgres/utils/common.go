@@ -12,14 +12,37 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Masterminds/squirrel"
 
+	"github.com/Permify/permify/internal"
 	base "github.com/Permify/permify/pkg/pb/base/v1"
+	"github.com/Permify/permify/pkg/telemetry"
 )
+
+var (
+	databaseErrorHandlerCallsCounter = telemetry.NewCounter(internal.Meter, "database_error_handler_calls", "Number of errors mapped at error level by storage utils.HandleError, by error code")
+	errorCodeAttrs                   = func() map[base.ErrorCode]metric.MeasurementOption {
+		m := make(map[base.ErrorCode]metric.MeasurementOption, len(base.ErrorCode_name))
+		for code, name := range base.ErrorCode_name {
+			m[base.ErrorCode(code)] = metric.WithAttributeSet(attribute.NewSet(attribute.String("code", name)))
+		}
+		return m
+	}()
+	unknownErrorCodeAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("code", "UNKNOWN")))
+)
+
+func errorCodeMeasurementOption(code base.ErrorCode) metric.MeasurementOption {
+	if opt, ok := errorCodeAttrs[code]; ok {
+		return opt
+	}
+	return unknownErrorCodeAttrs
+}
 
 const (
 	TransactionTemplate       = `INSERT INTO transactions (tenant_id) VALUES ($1) RETURNING id, snapshot`
@@ -134,6 +157,7 @@ func HandleError(ctx context.Context, span trace.Span, err error, errorCode base
 	}
 
 	// For all other types of errors, log them at the error level and record them in the span
+	databaseErrorHandlerCallsCounter.Add(ctx, 1, errorCodeMeasurementOption(errorCode))
 	slog.ErrorContext(ctx, "An operational error occurred",
 		slog.Any("error", err))
 	span.RecordError(err)

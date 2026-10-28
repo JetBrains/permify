@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/rs/xid"
+	"go.opentelemetry.io/otel/attribute"
 	api "go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/status"
 
@@ -19,6 +20,13 @@ import (
 	"github.com/Permify/permify/pkg/telemetry"
 )
 
+var (
+	writeSharedSchemaErrAttrs  = api.WithAttributeSet(attribute.NewSet(attribute.String("op", "write_shared_schema")))
+	readSharedSchemaErrAttrs   = api.WithAttributeSet(attribute.NewSet(attribute.String("op", "read_shared_schema")))
+	assignSharedSchemaErrAttrs = api.WithAttributeSet(attribute.NewSet(attribute.String("op", "assign_shared_schema")))
+	listSharedSchemaErrAttrs   = api.WithAttributeSet(attribute.NewSet(attribute.String("op", "list_shared_schema")))
+)
+
 // SharedSchemaServer - Structure for Shared Schema Server
 type SharedSchemaServer struct {
 	v1.UnimplementedSharedSchemaServer
@@ -29,6 +37,7 @@ type SharedSchemaServer struct {
 	readSharedSchemaCounter   api.Int64Counter
 	listSharedSchemaCounter   api.Int64Counter
 	assignSharedSchemaCounter api.Int64Counter
+	errorsCounter             api.Int64Counter
 }
 
 // NewSharedSchemaServer - Creates new Shared Schema Server
@@ -40,6 +49,7 @@ func NewSharedSchemaServer(ssw storage.SharedSchemaWriter, ssr storage.SharedSch
 		readSharedSchemaCounter:   telemetry.NewCounter(internal.Meter, "read_shared_schema", "Number of reading shared schema"),
 		listSharedSchemaCounter:   telemetry.NewCounter(internal.Meter, "list_shared_schema", "Number of listing shared schema"),
 		assignSharedSchemaCounter: telemetry.NewCounter(internal.Meter, "assign_shared_schema", "Number of assigning shared schema"),
+		errorsCounter:             telemetry.NewCounter(internal.Meter, "shared_schema_server_errors", "Number of failed SharedSchemaServer RPC calls, by operation"),
 	}
 }
 
@@ -50,6 +60,7 @@ func (r *SharedSchemaServer) Write(ctx context.Context, request *v1.SharedSchema
 
 	sch, err := parser.NewParser(request.GetSchema()).Parse()
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, writeSharedSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		return nil, status.Error(GetStatus(err), err.Error())
@@ -57,6 +68,7 @@ func (r *SharedSchemaServer) Write(ctx context.Context, request *v1.SharedSchema
 
 	_, _, err = compiler.NewCompiler(true, sch).Compile()
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, writeSharedSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		return nil, status.Error(GetStatus(err), err.Error())
@@ -76,6 +88,7 @@ func (r *SharedSchemaServer) Write(ctx context.Context, request *v1.SharedSchema
 
 	err = r.ssw.WriteSharedSchema(ctx, cnf)
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, writeSharedSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -98,6 +111,7 @@ func (r *SharedSchemaServer) Read(ctx context.Context, request *v1.SharedSchemaR
 	if version == "" {
 		ver, err := r.ssr.SharedHeadVersion(ctx, request.GetSharedSchemaId())
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, readSharedSchemaErrAttrs)
 			return nil, status.Error(GetStatus(err), err.Error())
 		}
 		version = ver
@@ -105,6 +119,7 @@ func (r *SharedSchemaServer) Read(ctx context.Context, request *v1.SharedSchemaR
 
 	response, err := r.ssr.ReadSharedSchema(ctx, request.GetSharedSchemaId(), version)
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, readSharedSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -126,6 +141,7 @@ func (r *SharedSchemaServer) Assign(ctx context.Context, request *v1.SharedSchem
 	// Validate shared schema exists
 	_, err := r.ssr.SharedHeadVersion(ctx, request.GetSharedSchemaId())
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, assignSharedSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		return nil, status.Error(GetStatus(err), err.Error())
@@ -133,6 +149,7 @@ func (r *SharedSchemaServer) Assign(ctx context.Context, request *v1.SharedSchem
 
 	err = r.ssw.AssignSharedSchema(ctx, request.GetSharedSchemaId(), request.GetTenantIds())
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, assignSharedSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -153,6 +170,7 @@ func (r *SharedSchemaServer) List(ctx context.Context, request *v1.SharedSchemaL
 
 	schemas, ct, err := r.ssr.ListSharedSchemas(ctx, database.NewPagination(database.Size(request.GetPageSize()), database.Token(request.GetContinuousToken())))
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, listSharedSchemaErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())

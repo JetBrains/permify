@@ -1,16 +1,39 @@
 package balancer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/resolver"
 
+	"github.com/Permify/permify/internal"
 	"github.com/Permify/permify/pkg/consistent"
+	"github.com/Permify/permify/pkg/telemetry"
+)
+
+var (
+	defaultResolverUpdatesCounter = telemetry.NewCounter(internal.Meter, "balancer_resolver_updates", "Number of gRPC consistent-hash balancer resolver and client-conn state updates, by result")
+	defaultSubConnEventsCounter   = telemetry.NewCounter(internal.Meter, "balancer_subconn_events", "Number of gRPC consistent-hash balancer SubConn lifecycle events, by event")
+
+	resolverOkAttrs               = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "ok")))
+	resolverZeroAddressesAttrs    = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "zero_addresses")))
+	resolverNoConfigAttrs         = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "no_config")))
+	resolverTransientFailureAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "transient_failure")))
+	resolverErrorAttrs            = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "resolver_error")))
+
+	subConnCreatedAttrs          = metric.WithAttributeSet(attribute.NewSet(attribute.String("event", "created")))
+	subConnCreateFailedAttrs     = metric.WithAttributeSet(attribute.NewSet(attribute.String("event", "create_failed")))
+	subConnReadyAttrs            = metric.WithAttributeSet(attribute.NewSet(attribute.String("event", "ready")))
+	subConnTransientFailureAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("event", "transient_failure")))
+	subConnShutdownAttrs         = metric.WithAttributeSet(attribute.NewSet(attribute.String("event", "shutdown")))
+	subConnUnknownAttrs          = metric.WithAttributeSet(attribute.NewSet(attribute.String("event", "unknown")))
 )
 
 type Balancer struct {
@@ -47,9 +70,29 @@ type Balancer struct {
 
 	// Stores the last connection error encountered.
 	lastConnectionError error
+
+	resolverUpdatesCounter metric.Int64Counter
+	subConnEventsCounter   metric.Int64Counter
+}
+
+func (b *Balancer) recordResolverUpdate(attrs metric.MeasurementOption) {
+	if b.resolverUpdatesCounter != nil {
+		b.resolverUpdatesCounter.Add(context.Background(), 1, attrs)
+		return
+	}
+	defaultResolverUpdatesCounter.Add(context.Background(), 1, attrs)
+}
+
+func (b *Balancer) recordSubConnEvent(attrs metric.MeasurementOption) {
+	if b.subConnEventsCounter != nil {
+		b.subConnEventsCounter.Add(context.Background(), 1, attrs)
+		return
+	}
+	defaultSubConnEventsCounter.Add(context.Background(), 1, attrs)
 }
 
 func (b *Balancer) ResolverError(err error) {
+	b.recordResolverUpdate(resolverErrorAttrs)
 	b.lastResolverError = err
 	if b.addressSubConns.Len() == 0 {
 		b.state = connectivity.TransientFailure
@@ -95,6 +138,7 @@ func (b *Balancer) UpdateClientConnState(s balancer.ClientConnState) error {
 
 	// Check if the consistent hashing configuration exists.
 	if b.consistent == nil {
+		b.recordResolverUpdate(resolverNoConfigAttrs)
 		slog.Error("No consistent hashing configuration found")
 		b.picker.Store(nil)
 		b.updateGRPCState()
@@ -110,6 +154,7 @@ func (b *Balancer) UpdateClientConnState(s balancer.ClientConnState) error {
 		if _, ok := b.addressSubConns.Get(addr); !ok {
 			sc, err := b.clientConn.NewSubConn([]resolver.Address{addr}, balancer.NewSubConnOptions{HealthCheckEnabled: false})
 			if err != nil {
+				b.recordSubConnEvent(subConnCreateFailedAttrs)
 				slog.Warn("Failed to create new SubConn",
 					slog.String("address", addr.Addr),
 					slog.String("server_name", addr.ServerName),
@@ -117,6 +162,7 @@ func (b *Balancer) UpdateClientConnState(s balancer.ClientConnState) error {
 				)
 				continue
 			}
+			b.recordSubConnEvent(subConnCreatedAttrs)
 
 			b.addressSubConns.Set(addr, sc)
 			b.subConnStates[sc] = connectivity.Idle
@@ -160,12 +206,14 @@ func (b *Balancer) UpdateClientConnState(s balancer.ClientConnState) error {
 	if len(s.ResolverState.Addresses) == 0 {
 		err := errors.New("resolver produced zero addresses")
 		b.ResolverError(err)
+		b.recordResolverUpdate(resolverZeroAddressesAttrs)
 		slog.Error("Resolver produced zero addresses")
 		return balancer.ErrBadResolverState
 	}
 
 	// Update the application picker.
 	if b.state == connectivity.TransientFailure {
+		b.recordResolverUpdate(resolverTransientFailureAttrs)
 		slog.Warn("Transient failure detected")
 		b.picker.Store(nil)
 	} else {
@@ -175,6 +223,7 @@ func (b *Balancer) UpdateClientConnState(s balancer.ClientConnState) error {
 		}
 		slog.Info("Creating new picker", slog.Int("width", width))
 		b.picker.Store(&picker{consistent: b.consistent, width: width})
+		b.recordResolverUpdate(resolverOkAttrs)
 	}
 
 	b.updateGRPCState()
@@ -191,6 +240,7 @@ func (b *Balancer) UpdateSubConnState(sc balancer.SubConn, state balancer.SubCon
 
 	oldS, ok := b.subConnStates[sc]
 	if !ok {
+		b.recordSubConnEvent(subConnUnknownAttrs)
 		slog.Warn("State change for unknown SubConn",
 			slog.String("connectivity_state", s.String()),
 			slog.String("sub_conn", fmt.Sprintf("%p", sc)),
@@ -215,12 +265,16 @@ func (b *Balancer) UpdateSubConnState(sc balancer.SubConn, state balancer.SubCon
 			slog.String("sub_conn", fmt.Sprintf("%p", sc)),
 		)
 		sc.Connect()
+	case connectivity.Ready:
+		b.recordSubConnEvent(subConnReadyAttrs)
 	case connectivity.Shutdown:
+		b.recordSubConnEvent(subConnShutdownAttrs)
 		slog.Info("Removing shutdown SubConn",
 			slog.String("sub_conn", fmt.Sprintf("%p", sc)),
 		)
 		delete(b.subConnStates, sc)
 	case connectivity.TransientFailure:
+		b.recordSubConnEvent(subConnTransientFailureAttrs)
 		slog.Warn("SubConn in transient failure",
 			slog.String("sub_conn", fmt.Sprintf("%p", sc)),
 			slog.String("error", state.ConnectionError.Error()),

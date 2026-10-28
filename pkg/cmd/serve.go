@@ -372,6 +372,15 @@ func serve() func(cmd *cobra.Command, args []string) error {
 		defer engineKeyCache.Close()
 
 		if cfg.Meter.Enabled {
+			limitReg, err := registerLimitMetrics(internal.Meter, cfg)
+			if err != nil {
+				slog.Error(err.Error())
+				return err
+			}
+			defer func() {
+				_ = limitReg.Unregister()
+			}()
+
 			headers := map[string]string{}
 			for _, header := range cfg.Meter.Headers {
 				h := strings.Split(header, ":")
@@ -599,6 +608,91 @@ func circuitBreakerStateChangeRecorder(meter otelmetric.Meter) func(name string,
 			attribute.String("to", to.String()),
 		))
 	}
+}
+
+// registerLimitMetrics registers observable gauges for Permify's configured operational limits
+// so dashboards and alerts can compute saturation ratios without hardcoding configuration values.
+func registerLimitMetrics(meter otelmetric.Meter, cfg *config.Config) (otelmetric.Registration, error) {
+	type limitGauge struct {
+		name        string
+		description string
+		value       int64
+		instrument  otelmetric.Int64ObservableGauge
+	}
+
+	maxConns := cfg.Database.MaxConnections
+	if maxConns <= 0 {
+		maxConns = cfg.Database.MaxOpenConnections
+	}
+	minConns := cfg.Database.MinConnections
+	if minConns <= 0 {
+		minConns = cfg.Database.MaxIdleConnections
+	}
+
+	gauges := []*limitGauge{
+		{
+			name:        "permission_bulk_limit",
+			description: "Configured maximum number of items per BulkCheck request and engine SQL batch",
+			value:       int64(cfg.Service.Permission.BulkLimit),
+		},
+		{
+			name:        "permission_concurrency_limit",
+			description: "Configured concurrency limit per permission request",
+			value:       int64(cfg.Service.Permission.ConcurrencyLimit),
+		},
+		{
+			name:        "server_rate_limit",
+			description: "Configured maximum number of requests per second allowed by the server rate limiter",
+			value:       cfg.Server.RateLimit,
+		},
+		{
+			name:        "database_max_connections",
+			description: "Configured maximum number of connections in each database pool",
+			value:       int64(maxConns),
+		},
+		{
+			name:        "database_min_connections",
+			description: "Configured minimum number of connections in each database pool",
+			value:       int64(minConns),
+		},
+		{
+			name:        "database_max_data_per_write",
+			description: "Configured maximum number of tuples and attributes per database write",
+			value:       int64(cfg.Database.MaxDataPerWrite),
+		},
+		{
+			name:        "database_max_retries",
+			description: "Configured maximum number of retries for serializable database transactions",
+			value:       int64(cfg.Database.MaxRetries),
+		},
+		{
+			name:        "database_watch_buffer_size",
+			description: "Configured channel buffer size for Watch change events",
+			value:       int64(cfg.Database.WatchBufferSize),
+		},
+		{
+			name:        "authn_oidc_backoff_max_retries",
+			description: "Configured maximum number of OIDC JWKS fetch retries within a backoff interval",
+			value:       int64(cfg.Authn.Oidc.BackoffMaxRetries),
+		},
+	}
+
+	instruments := make([]otelmetric.Observable, 0, len(gauges))
+	for _, g := range gauges {
+		inst, err := meter.Int64ObservableGauge(g.name, otelmetric.WithDescription(g.description))
+		if err != nil {
+			return nil, err
+		}
+		g.instrument = inst
+		instruments = append(instruments, inst)
+	}
+
+	return meter.RegisterCallback(func(_ context.Context, o otelmetric.Observer) error {
+		for _, g := range gauges {
+			o.ObserveInt64(g.instrument, g.value)
+		}
+		return nil
+	}, instruments...)
 }
 
 // getLogLevel converts a string representation of log level to its corresponding slog.Level value.

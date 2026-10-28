@@ -55,7 +55,7 @@ func New(opts ...Option) (*Ristretto, error) {
 		return rs, err
 	}
 
-	if err = rs.registerMetrics(); err != nil {
+	if err = rs.registerMetrics(mc); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -65,7 +65,7 @@ func New(opts ...Option) (*Ristretto, error) {
 
 // registerMetrics - Exports the ristretto internal eviction, admission, and cost metrics as observable instruments.
 // Hit and miss counts are recorded by the domain cache wrappers (permission_cache_lookups and schema_cache_lookups).
-func (r *Ristretto) registerMetrics() error {
+func (r *Ristretto) registerMetrics(maxCost uint64) error {
 	type observableCounter struct {
 		name        string
 		description string
@@ -81,7 +81,7 @@ func (r *Ristretto) registerMetrics() error {
 		{name: "cache_sets_rejected", description: "Number of cache Set calls rejected by the admission policy", value: (*ristretto.Metrics).SetsRejected},
 	}
 
-	instruments := make([]metric.Observable, 0, len(counters)+1)
+	instruments := make([]metric.Observable, 0, len(counters)+4)
 	for _, counter := range counters {
 		instrument, err := r.meter.Int64ObservableCounter(
 			counter.name,
@@ -103,8 +103,38 @@ func (r *Ristretto) registerMetrics() error {
 	}
 	instruments = append(instruments, costUsed)
 
+	maxCostGauge, err := r.meter.Int64ObservableGauge(
+		"cache_max_cost",
+		metric.WithDescription("Configured maximum cost of the cache"),
+	)
+	if err != nil {
+		return err
+	}
+	instruments = append(instruments, maxCostGauge)
+
+	numCountersGauge, err := r.meter.Int64ObservableGauge(
+		"cache_num_counters",
+		metric.WithDescription("Configured number of TinyLFU frequency counters in the cache"),
+	)
+	if err != nil {
+		return err
+	}
+	instruments = append(instruments, numCountersGauge)
+
+	bufferItemsGauge, err := r.meter.Int64ObservableGauge(
+		"cache_buffer_items",
+		metric.WithDescription("Configured size of the cache Set buffer"),
+	)
+	if err != nil {
+		return err
+	}
+	instruments = append(instruments, bufferItemsGauge)
+
 	attrs := metric.WithAttributeSet(attribute.NewSet(attribute.String("cache", r.name)))
 	metrics := r.c.Metrics
+	configuredMaxCost := toInt64(maxCost)
+	configuredNumCounters := r.numCounters
+	configuredBufferItems := r.bufferItems
 
 	r.registration, err = r.meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		for _, counter := range counters {
@@ -116,6 +146,9 @@ func (r *Ristretto) registerMetrics() error {
 			used = toInt64(added - evicted)
 		}
 		o.ObserveInt64(costUsed, used, attrs)
+		o.ObserveInt64(maxCostGauge, configuredMaxCost, attrs)
+		o.ObserveInt64(numCountersGauge, configuredNumCounters, attrs)
+		o.ObserveInt64(bufferItemsGauge, configuredBufferItems, attrs)
 		return nil
 	}, instruments...)
 

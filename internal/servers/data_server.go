@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 
+	otelAttribute "go.opentelemetry.io/otel/attribute"
 	otelCodes "go.opentelemetry.io/otel/codes"
 	api "go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/status"
@@ -16,6 +17,16 @@ import (
 	v1 "github.com/Permify/permify/pkg/pb/base/v1"
 	"github.com/Permify/permify/pkg/telemetry"
 	"github.com/Permify/permify/pkg/tuple"
+)
+
+var (
+	writeDataErrAttrs           = api.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("op", "write_data")))
+	deleteDataErrAttrs          = api.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("op", "delete_data")))
+	readAttributesErrAttrs      = api.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("op", "read_attributes")))
+	readRelationshipsErrAttrs   = api.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("op", "read_relationships")))
+	writeRelationshipsErrAttrs  = api.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("op", "write_relationships")))
+	deleteRelationshipsErrAttrs = api.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("op", "delete_relationships")))
+	runBundleErrAttrs           = api.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("op", "run_bundle")))
 )
 
 // DataServer - Structure for Data Server
@@ -33,6 +44,7 @@ type DataServer struct {
 	writeRelationshipsCounter  api.Int64Counter
 	deleteRelationshipsCounter api.Int64Counter
 	runBundleCounter           api.Int64Counter
+	errorsCounter              api.Int64Counter
 }
 
 // NewDataServer - Creates new Data Server
@@ -54,6 +66,7 @@ func NewDataServer(
 		writeRelationshipsCounter:  telemetry.NewCounter(internal.Meter, "write_relationships", "Number of writing relationships"),
 		deleteRelationshipsCounter: telemetry.NewCounter(internal.Meter, "delete_relationships", "Number of deleting relationships"),
 		runBundleCounter:           telemetry.NewCounter(internal.Meter, "run_bundle", "Number of running bundle"),
+		errorsCounter:              telemetry.NewCounter(internal.Meter, "data_server_errors", "Number of failed DataServer RPC calls, by operation"),
 	}
 }
 
@@ -69,6 +82,7 @@ func (r *DataServer) ReadRelationships(ctx context.Context, request *v1.Relation
 
 	v := request.Validate()
 	if v != nil {
+		r.errorsCounter.Add(ctx, 1, readRelationshipsErrAttrs)
 		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
 	}
 
@@ -76,6 +90,7 @@ func (r *DataServer) ReadRelationships(ctx context.Context, request *v1.Relation
 	if snap == "" {
 		st, err := r.dr.HeadSnapshot(ctx, request.GetTenantId())
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, readRelationshipsErrAttrs)
 			return nil, status.Error(GetStatus(err), err.Error()) // Return snapshot error
 		}
 		snap = st.Encode().String()
@@ -92,6 +107,7 @@ func (r *DataServer) ReadRelationships(ctx context.Context, request *v1.Relation
 		),
 	)
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, readRelationshipsErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -118,6 +134,7 @@ func (r *DataServer) ReadAttributes(ctx context.Context, request *v1.AttributeRe
 
 	v := request.Validate()
 	if v != nil {
+		r.errorsCounter.Add(ctx, 1, readAttributesErrAttrs)
 		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
 	}
 
@@ -125,6 +142,7 @@ func (r *DataServer) ReadAttributes(ctx context.Context, request *v1.AttributeRe
 	if snap == "" {
 		st, err := r.dr.HeadSnapshot(ctx, request.GetTenantId())
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, readAttributesErrAttrs)
 			return nil, status.Error(GetStatus(err), err.Error()) // Return snapshot error
 		}
 		snap = st.Encode().String()
@@ -141,6 +159,7 @@ func (r *DataServer) ReadAttributes(ctx context.Context, request *v1.AttributeRe
 		),
 	)
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, readAttributesErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -162,6 +181,7 @@ func (r *DataServer) Write(ctx context.Context, request *v1.DataWriteRequest) (*
 
 	v := request.Validate()
 	if v != nil {
+		r.errorsCounter.Add(ctx, 1, writeDataErrAttrs)
 		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
 	}
 
@@ -171,6 +191,7 @@ func (r *DataServer) Write(ctx context.Context, request *v1.DataWriteRequest) (*
 		var err error
 		sharedSchemaID, version, err = r.sr.HeadVersion(ctx, request.GetTenantId())
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, writeDataErrAttrs)
 			span.RecordError(err)
 			span.SetStatus(otelCodes.Error, err.Error())
 			return nil, status.Error(GetStatus(err), err.Error()) // Return version error
@@ -192,6 +213,7 @@ func (r *DataServer) Write(ctx context.Context, request *v1.DataWriteRequest) (*
 
 		definition, _, err := r.sr.ReadEntityDefinition(ctx, request.GetTenantId(), sharedSchemaID, tup.GetEntity().GetType(), version)
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, writeDataErrAttrs)
 			span.RecordError(err)
 			span.SetStatus(otelCodes.Error, err.Error())
 			return nil, status.Error(GetStatus(err), err.Error()) // Return entity definition error
@@ -199,6 +221,7 @@ func (r *DataServer) Write(ctx context.Context, request *v1.DataWriteRequest) (*
 
 		err = validation.ValidateTuple(definition, tup)
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, writeDataErrAttrs)
 			span.RecordError(err)
 			span.SetStatus(otelCodes.Error, err.Error())
 			return nil, status.Error(GetStatus(err), err.Error()) // Return tuple validation error
@@ -222,6 +245,7 @@ func (r *DataServer) Write(ctx context.Context, request *v1.DataWriteRequest) (*
 
 		definition, _, err := r.sr.ReadEntityDefinition(ctx, request.GetTenantId(), sharedSchemaID, attr.GetEntity().GetType(), version)
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, writeDataErrAttrs)
 			span.RecordError(err)
 			span.SetStatus(otelCodes.Error, err.Error())
 			return nil, status.Error(GetStatus(err), err.Error()) // Return entity definition error
@@ -229,6 +253,7 @@ func (r *DataServer) Write(ctx context.Context, request *v1.DataWriteRequest) (*
 
 		err = validation.ValidateAttribute(definition, attr)
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, writeDataErrAttrs)
 			span.RecordError(err)
 			span.SetStatus(otelCodes.Error, err.Error())
 			return nil, status.Error(GetStatus(err), err.Error()) // Return attribute validation error
@@ -239,6 +264,7 @@ func (r *DataServer) Write(ctx context.Context, request *v1.DataWriteRequest) (*
 
 	snap, err := r.dw.Write(ctx, request.GetTenantId(), database.NewTupleCollection(relationships...), database.NewAttributeCollection(attrs...))
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, writeDataErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -259,6 +285,7 @@ func (r *DataServer) WriteRelationships(ctx context.Context, request *v1.Relatio
 
 	v := request.Validate()
 	if v != nil {
+		r.errorsCounter.Add(ctx, 1, writeRelationshipsErrAttrs)
 		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
 	}
 
@@ -268,6 +295,7 @@ func (r *DataServer) WriteRelationships(ctx context.Context, request *v1.Relatio
 		var err error
 		sharedSchemaID, version, err = r.sr.HeadVersion(ctx, request.GetTenantId())
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, writeRelationshipsErrAttrs)
 			span.RecordError(err)
 			span.SetStatus(otelCodes.Error, err.Error())
 			return nil, status.Error(GetStatus(err), err.Error()) // Return version error
@@ -289,6 +317,7 @@ func (r *DataServer) WriteRelationships(ctx context.Context, request *v1.Relatio
 
 		definition, _, err := r.sr.ReadEntityDefinition(ctx, request.GetTenantId(), sharedSchemaID, tup.GetEntity().GetType(), version)
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, writeRelationshipsErrAttrs)
 			span.RecordError(err)
 			span.SetStatus(otelCodes.Error, err.Error())
 			return nil, status.Error(GetStatus(err), err.Error()) // Return entity definition error
@@ -296,6 +325,7 @@ func (r *DataServer) WriteRelationships(ctx context.Context, request *v1.Relatio
 
 		err = validation.ValidateTuple(definition, tup)
 		if err != nil {
+			r.errorsCounter.Add(ctx, 1, writeRelationshipsErrAttrs)
 			span.RecordError(err)
 			span.SetStatus(otelCodes.Error, err.Error())
 			return nil, status.Error(GetStatus(err), err.Error()) // Return tuple validation error
@@ -306,6 +336,7 @@ func (r *DataServer) WriteRelationships(ctx context.Context, request *v1.Relatio
 
 	snap, err := r.dw.Write(ctx, request.GetTenantId(), database.NewTupleCollection(relationships...), database.NewAttributeCollection())
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, writeRelationshipsErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -326,16 +357,19 @@ func (r *DataServer) Delete(ctx context.Context, request *v1.DataDeleteRequest) 
 
 	v := request.Validate()
 	if v != nil {
+		r.errorsCounter.Add(ctx, 1, deleteDataErrAttrs)
 		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
 	}
 
 	err := validation.ValidateFilters(request.GetTupleFilter(), request.GetAttributeFilter())
 	if err != nil {
-		return nil, status.Error(GetStatus(v), err.Error())
+		r.errorsCounter.Add(ctx, 1, deleteDataErrAttrs)
+		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
 	snap, err := r.dw.Delete(ctx, request.GetTenantId(), request.GetTupleFilter(), request.GetAttributeFilter())
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, deleteDataErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -356,16 +390,19 @@ func (r *DataServer) DeleteRelationships(ctx context.Context, request *v1.Relati
 
 	v := request.Validate()
 	if v != nil {
+		r.errorsCounter.Add(ctx, 1, deleteRelationshipsErrAttrs)
 		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
 	}
 
 	err := validation.ValidateTupleFilter(request.GetFilter())
 	if err != nil {
-		return nil, status.Error(GetStatus(v), err.Error())
+		r.errorsCounter.Add(ctx, 1, deleteRelationshipsErrAttrs)
+		return nil, status.Error(GetStatus(err), err.Error())
 	}
 
 	snap, err := r.dw.Delete(ctx, request.GetTenantId(), request.GetFilter(), &v1.AttributeFilter{})
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, deleteRelationshipsErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -386,11 +423,13 @@ func (r *DataServer) RunBundle(ctx context.Context, request *v1.BundleRunRequest
 
 	v := request.Validate()
 	if v != nil {
+		r.errorsCounter.Add(ctx, 1, runBundleErrAttrs)
 		return nil, status.Error(GetStatus(v), v.Error()) // Return validation error
 	}
 
 	bundle, err := r.br.Read(ctx, request.GetTenantId(), request.GetName())
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, runBundleErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())
@@ -399,11 +438,13 @@ func (r *DataServer) RunBundle(ctx context.Context, request *v1.BundleRunRequest
 
 	err = validation.ValidateBundleArguments(bundle.GetArguments(), request.GetArguments())
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, runBundleErrAttrs)
 		return nil, status.Error(GetStatus(err), err.Error()) // Return bundle argument validation error
 	}
 
 	snap, err := r.dw.RunBundle(ctx, request.GetTenantId(), request.GetArguments(), bundle)
 	if err != nil {
+		r.errorsCounter.Add(ctx, 1, runBundleErrAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		slog.ErrorContext(ctx, err.Error())

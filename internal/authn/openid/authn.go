@@ -16,10 +16,57 @@ import (
 	grpcauth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/lestrrat-go/jwx/jwk"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
+	"github.com/Permify/permify/internal"
 	"github.com/Permify/permify/internal/config"
 	base "github.com/Permify/permify/pkg/pb/base/v1"
+	"github.com/Permify/permify/pkg/telemetry"
 )
+
+var (
+	oidcOkAttrs                 = oidcAuthAttrs("ok", "ok")
+	oidcMissingBearerTokenAttrs = oidcAuthAttrs("error", "missing_bearer_token")
+	oidcInvalidBearerTokenAttrs = oidcAuthAttrs("error", "invalid_bearer_token")
+	oidcInvalidClaimsAttrs      = oidcAuthAttrs("error", "invalid_claims")
+	oidcInvalidIssuerAttrs      = oidcAuthAttrs("error", "invalid_issuer")
+	oidcInvalidAudienceAttrs    = oidcAuthAttrs("error", "invalid_audience")
+
+	jwksFetchOkAttrs      = jwksOpAttrs("fetch", "ok")
+	jwksFetchErrorAttrs   = jwksOpAttrs("fetch", "error")
+	jwksRefreshOkAttrs    = jwksOpAttrs("refresh", "ok")
+	jwksRefreshErrorAttrs = jwksOpAttrs("refresh", "error")
+
+	jwksRetryAttrs              = metric.WithAttributeSet(attribute.NewSet(attribute.String("reason", "retry")))
+	jwksBackoffActiveAttrs      = metric.WithAttributeSet(attribute.NewSet(attribute.String("reason", "backoff_active")))
+	jwksMaxRetriesExceededAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("reason", "max_retries_exceeded")))
+)
+
+func oidcAuthAttrs(result, reason string) metric.MeasurementOption {
+	return metric.WithAttributeSet(attribute.NewSet(
+		attribute.String("method", "oidc"),
+		attribute.String("result", result),
+		attribute.String("reason", reason),
+	))
+}
+
+func jwksOpAttrs(op, result string) metric.MeasurementOption {
+	return metric.WithAttributeSet(attribute.NewSet(
+		attribute.String("op", op),
+		attribute.String("result", result),
+	))
+}
+
+// Option - Option type for OIDC Authn
+type Option func(*Authn)
+
+// WithMeter - Sets the meter used to create OIDC Authn metrics.
+func WithMeter(meter metric.Meter) Option {
+	return func(a *Authn) {
+		a.meter = meter
+	}
+}
 
 type Authn struct {
 	// URL of the issuer. This is typically the base URL of the identity provider.
@@ -46,10 +93,15 @@ type Authn struct {
 	globalFirstSeen  time.Time
 	retriedKeys      map[string]bool
 	mutex            sync.Mutex // protects concurrent access to retry state
+
+	meter               metric.Meter
+	requestsCounter     metric.Int64Counter
+	jwksRequestsCounter metric.Int64Counter
+	jwksRetriesCounter  metric.Int64Counter
 }
 
 // NewOidcAuthn creates a new OIDC authenticator.
-func NewOidcAuthn(ctx context.Context, conf config.Oidc) (*Authn, error) {
+func NewOidcAuthn(ctx context.Context, conf config.Oidc, opts ...Option) (*Authn, error) {
 	// Create a new HTTP client with retry capabilities. This client is used for making HTTP requests, particularly for fetching OIDC configuration.
 	client := retryablehttp.NewClient()
 	client.Logger = SlogAdapter{Logger: slog.Default()}
@@ -95,12 +147,21 @@ func NewOidcAuthn(ctx context.Context, conf config.Oidc) (*Authn, error) {
 		retriedKeys:       make(map[string]bool),
 		globalFirstSeen:   time.Time{},
 		mutex:             sync.Mutex{},
+		meter:             internal.Meter,
 	}
+	for _, opt := range opts {
+		opt(oidc)
+	}
+	oidc.requestsCounter = telemetry.NewCounter(oidc.meter, "authn_requests", "Number of authentication requests, by method, result and reason")
+	oidc.jwksRequestsCounter = telemetry.NewCounter(oidc.meter, "oidc_jwks_cache_operations", "Number of AutoRefresh Fetch and Refresh API calls, including cache hits, by operation and result")
+	oidc.jwksRetriesCounter = telemetry.NewCounter(oidc.meter, "oidc_jwks_retries", "Number of OIDC JWKS retry and backoff events, by reason")
 
 	// Attempt to fetch the JWKS immediately to ensure it's available and valid.
 	if _, err := oidc.jwksSet.Fetch(ctx, oidc.JwksURI); err != nil {
+		oidc.jwksRequestsCounter.Add(ctx, 1, jwksFetchErrorAttrs)
 		return nil, fmt.Errorf("failed to fetch JWKS: %w", err)
 	}
+	oidc.jwksRequestsCounter.Add(ctx, 1, jwksFetchOkAttrs)
 
 	return oidc, nil
 }
@@ -110,6 +171,7 @@ func (oidc *Authn) Authenticate(ctx context.Context) error {
 	// Extract the authorization header from the metadata of the incoming gRPC request.
 	authHeader, err := grpcauth.AuthFromMD(ctx, "Bearer")
 	if err != nil { // Check for authentication errors
+		oidc.requestsCounter.Add(ctx, 1, oidcMissingBearerTokenAttrs)
 		slog.Error("failed to extract authorization header from gRPC request", "error", err)
 		return errors.New(base.ErrorCode_ERROR_CODE_MISSING_BEARER_TOKEN.String())
 	}
@@ -128,12 +190,14 @@ func (oidc *Authn) Authenticate(ctx context.Context) error {
 		return nil, errors.New("kid must be specified in the token header")
 	})
 	if err != nil {
+		oidc.requestsCounter.Add(ctx, 1, oidcInvalidBearerTokenAttrs)
 		slog.Error("token parsing or validation failed", "error", err)
 		return errors.New(base.ErrorCode_ERROR_CODE_INVALID_BEARER_TOKEN.String())
 	}
 
 	// Ensure the token is valid.
 	if !parsedToken.Valid {
+		oidc.requestsCounter.Add(ctx, 1, oidcInvalidBearerTokenAttrs)
 		slog.Warn("parsed token is invalid")
 		return errors.New(base.ErrorCode_ERROR_CODE_INVALID_BEARER_TOKEN.String())
 	}
@@ -141,6 +205,7 @@ func (oidc *Authn) Authenticate(ctx context.Context) error {
 	// Extract the claims from the token.
 	claims, ok := parsedToken.Claims.(jwt.MapClaims)
 	if !ok {
+		oidc.requestsCounter.Add(ctx, 1, oidcInvalidClaimsAttrs)
 		slog.Warn("token claims are in an incorrect format")
 		return errors.New(base.ErrorCode_ERROR_CODE_INVALID_CLAIMS.String())
 	}
@@ -149,16 +214,19 @@ func (oidc *Authn) Authenticate(ctx context.Context) error {
 
 	// Verify the issuer of the token matches the expected issuer.
 	if ok := claims.VerifyIssuer(oidc.IssuerURL, true); !ok {
+		oidc.requestsCounter.Add(ctx, 1, oidcInvalidIssuerAttrs)
 		slog.Warn("token issuer is invalid", "expected", oidc.IssuerURL, "actual", claims["iss"])
 		return errors.New(base.ErrorCode_ERROR_CODE_INVALID_ISSUER.String())
 	}
 	// Verify the audience of the token matches the expected audience.
 
 	if ok := claims.VerifyAudience(oidc.Audience, true); !ok {
+		oidc.requestsCounter.Add(ctx, 1, oidcInvalidAudienceAttrs)
 		slog.Warn("token audience is invalid", "expected", oidc.Audience, "actual", claims["aud"])
 		return errors.New(base.ErrorCode_ERROR_CODE_INVALID_AUDIENCE.String())
 	}
 
+	oidc.requestsCounter.Add(ctx, 1, oidcOkAttrs)
 	slog.Info("token validation succeeded")
 
 	// If all validations pass, return nil indicating the token is valid.
@@ -184,6 +252,7 @@ func (oidc *Authn) getKeyWithRetry(
 		oidc.retriedKeys = make(map[string]bool)
 	} else if oidc.globalRetryCount >= oidc.backoffMaxRetries {
 		// If max retries reached within the interval, unlock and check keyID once
+		oidc.jwksRetriesCounter.Add(ctx, 1, jwksBackoffActiveAttrs)
 		slog.Warn("max retries reached within interval, will check keyID once", "keyID", keyID)
 		oidc.mutex.Unlock()
 
@@ -228,6 +297,7 @@ func (oidc *Authn) getKeyWithRetry(
 		snapshotCount := oidc.globalRetryCount
 		oidc.retriedKeys[keyID] = true
 		if oidc.globalRetryCount > oidc.backoffMaxRetries {
+			oidc.jwksRetriesCounter.Add(ctx, 1, jwksMaxRetriesExceededAttrs)
 			slog.Error("key ID not found in JWKS due to exceeding global retries", "keyID", keyID, "globalRetryCount", oidc.globalRetryCount)
 			oidc.mutex.Unlock() // Unlock before returning
 			return nil, errors.New("too many retry attempts, backoff policy active due to global retry limit")
@@ -253,14 +323,17 @@ func (oidc *Authn) getKeyWithRetry(
 		}
 
 		oidc.globalRetryCount++ // Increment the global retry counter
+		oidc.jwksRetriesCounter.Add(ctx, 1, jwksRetryAttrs)
 		slog.Warn("retrying to fetch JWKS due to error", "keyID", keyID, "retries", retries, "error", err)
 		retries++ // Increment retry counter
 
 		if _, err := oidc.jwksSet.Refresh(ctx, oidc.JwksURI); err != nil {
 			oidc.mutex.Unlock()
+			oidc.jwksRequestsCounter.Add(ctx, 1, jwksRefreshErrorAttrs)
 			slog.Error("failed to refresh JWKS", "error", err)
 			return nil, err
 		}
+		oidc.jwksRequestsCounter.Add(ctx, 1, jwksRefreshOkAttrs)
 		// Unlock after Refresh to prevent concurrent duplicate refresh calls
 		oidc.mutex.Unlock() // Release lock after successful refresh
 	}
@@ -273,6 +346,7 @@ func (oidc *Authn) getKeyWithRetry(
 	}
 	oidc.mutex.Unlock()
 
+	oidc.jwksRetriesCounter.Add(ctx, 1, jwksMaxRetriesExceededAttrs)
 	slog.Error("key ID not found in JWKS after retries", "keyID", keyID)
 	return nil, errors.New("key ID not found in JWKS after retries")
 }
@@ -289,10 +363,12 @@ func (oidc *Authn) fetchKey(
 	// Fetch the JWKS from the configured URI
 	jwks, err := oidc.jwksSet.Fetch(ctx, oidc.JwksURI)
 	if err != nil { // Check for fetch errors
+		oidc.jwksRequestsCounter.Add(ctx, 1, jwksFetchErrorAttrs)
 		// Log an error and return if fetching fails
 		slog.Error("failed to fetch JWKS", "uri", oidc.JwksURI, "error", err)
 		return nil, fmt.Errorf("failed to fetch JWKS: %w", err)
 	}
+	oidc.jwksRequestsCounter.Add(ctx, 1, jwksFetchOkAttrs)
 
 	// Log a successful fetch of the JWKS
 	slog.InfoContext(ctx, "successfully fetched JWKS")

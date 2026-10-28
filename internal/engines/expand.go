@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/Permify/permify/internal"
 	"github.com/Permify/permify/internal/schema"
 	"github.com/Permify/permify/internal/storage"
 	storageContext "github.com/Permify/permify/internal/storage/context"
 	"github.com/Permify/permify/pkg/database"
 	base "github.com/Permify/permify/pkg/pb/base/v1"
+	"github.com/Permify/permify/pkg/telemetry"
 	"github.com/Permify/permify/pkg/tuple"
 )
 
@@ -26,6 +29,10 @@ type ExpandEngine struct {
 	concurrencyLimit int
 	// maxBatchSize is the maximum number of entity IDs per batched DB query (IN clause)
 	maxBatchSize int
+
+	meter                   metric.Meter
+	batchSplitsCounter      metric.Int64Counter
+	concurrencyWaitsCounter metric.Int64Counter
 }
 
 // NewExpandEngine - This function creates a new instance of ExpandEngine by taking a SchemaReader and a RelationshipReader as
@@ -37,10 +44,13 @@ func NewExpandEngine(sr storage.SchemaReader, rr storage.DataReader, opts ...Exp
 		dataReader:       rr,
 		concurrencyLimit: _defaultConcurrencyLimit,
 		maxBatchSize:     _defaultMaxBatchSize,
+		meter:            internal.Meter,
 	}
 	for _, opt := range opts {
 		opt(engine)
 	}
+	engine.batchSplitsCounter = telemetry.NewCounter(engine.meter, "engine_batch_splits", "Number of times an entity or subject batch exceeded bulk_limit and was split into an additional batch, by engine")
+	engine.concurrencyWaitsCounter = telemetry.NewCounter(engine.meter, "concurrency_limit_waits", "Number of times a request had to wait for a concurrency limit slot, by scope")
 	return engine
 }
 
@@ -330,6 +340,9 @@ func (engine *ExpandEngine) expandDirectRelation(request *base.PermissionExpandR
 		for _, key := range groupOrder {
 			ids := usersetGroups[key]
 			for i := 0; i < len(ids); i += engine.maxBatchSize {
+				if i > 0 {
+					engine.batchSplitsCounter.Add(ctx, 1, expandBatchSplitAttrs)
+				}
 				end := min(i+engine.maxBatchSize, len(ids))
 				fns, err := engine.createBatchedExpandFunctions(ctx, request, key.entityType, ids[i:end], key.relation)
 				if err != nil {
@@ -442,6 +455,9 @@ func (engine *ExpandEngine) expandTupleToUserSet(
 		for _, entityType := range typeOrder {
 			ids := subjectsByType[entityType]
 			for i := 0; i < len(ids); i += engine.maxBatchSize {
+				if i > 0 {
+					engine.batchSplitsCounter.Add(ctx, 1, expandBatchSplitAttrs)
+				}
 				end := min(i+engine.maxBatchSize, len(ids))
 				fns, err := engine.createBatchedExpandFunctions(ctx, request, entityType, ids[i:end], computedRelation)
 				if err != nil {
@@ -634,6 +650,9 @@ func (engine *ExpandEngine) createBatchedExpandFunctions(
 			for _, key := range subGroupOrder {
 				ids := subGroups[key]
 				for i := 0; i < len(ids); i += engine.maxBatchSize {
+					if i > 0 {
+						engine.batchSplitsCounter.Add(ctx, 1, expandBatchSplitAttrs)
+					}
 					end := min(i+engine.maxBatchSize, len(ids))
 					batchFns, err := engine.createBatchedExpandFunctions(ctx, parentRequest, key.entityType, ids[i:end], key.relation)
 					if err != nil {
@@ -982,6 +1001,9 @@ func (engine *ExpandEngine) expandOperation(
 	// Initialize an empty slice of channels which will receive ExpandResponses.
 	results := make([]chan ExpandResponse, 0, len(functions))
 	for _, fn := range functions {
+		if c.Err() != nil {
+			return expandFailResponse(errors.New(base.ErrorCode_ERROR_CODE_CANCELLED.String()))
+		}
 		fc := make(chan ExpandResponse, 1)
 		results = append(results, fc)
 
@@ -989,6 +1011,13 @@ func (engine *ExpandEngine) expandOperation(
 		case cl <- struct{}{}:
 		case <-c.Done():
 			return expandFailResponse(errors.New(base.ErrorCode_ERROR_CODE_CANCELLED.String()))
+		default:
+			engine.concurrencyWaitsCounter.Add(ctx, 1, expandConcurrencyWaitAttrs)
+			select {
+			case cl <- struct{}{}:
+			case <-c.Done():
+				return expandFailResponse(errors.New(base.ErrorCode_ERROR_CODE_CANCELLED.String()))
+			}
 		}
 
 		go func(f ExpandFunction, ch chan<- ExpandResponse) {

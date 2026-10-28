@@ -689,6 +689,8 @@ type BulkEntityPublisher struct {
 	bulkChecker *BulkChecker
 	// request contains the base lookup request parameters
 	request *base.PermissionLookupEntityRequest
+	// published counts candidate entities published to the bulkChecker
+	published atomic.Int64
 }
 
 // NewBulkEntityPublisher creates a new BulkEntityPublisher instance.
@@ -706,6 +708,11 @@ func NewBulkEntityPublisher(ctx context.Context, request *base.PermissionLookupE
 		bulkChecker: bulkChecker,
 		request:     request,
 	}
+}
+
+// PublishedCount returns the number of candidate entities sent to the BulkChecker.
+func (p *BulkEntityPublisher) PublishedCount() int64 {
+	return p.published.Load()
 }
 
 // Publish sends an entity permission check request to the bulk checker.
@@ -731,6 +738,7 @@ func (p *BulkEntityPublisher) Publish(entity *base.Entity, metadata *base.Permis
 		},
 		Result: result,
 	}:
+		p.published.Add(1)
 	case <-p.bulkChecker.ctx.Done():
 		// Context cancelled, drop the request
 	}

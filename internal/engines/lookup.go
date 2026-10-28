@@ -7,14 +7,18 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/metadata"
 
+	"github.com/Permify/permify/internal"
 	"github.com/Permify/permify/internal/invoke"
 	"github.com/Permify/permify/internal/storage"
 	"github.com/Permify/permify/internal/storage/context/utils"
 	"github.com/Permify/permify/pkg/database"
 	base "github.com/Permify/permify/pkg/pb/base/v1"
+	"github.com/Permify/permify/pkg/telemetry"
 )
 
 type LookupEngine struct {
@@ -30,6 +34,11 @@ type LookupEngine struct {
 	concurrencyLimit int
 	// maxBatchSize is the maximum number of subject IDs per batch query in EntityFilter
 	maxBatchSize int
+
+	meter                     metric.Meter
+	schemaCacheLookupsCounter metric.Int64Counter
+	candidatesCounter         metric.Int64Counter
+	matchedCounter            metric.Int64Counter
 }
 
 func NewLookupEngine(
@@ -45,12 +54,17 @@ func NewLookupEngine(
 		schemaMap:        sync.Map{},
 		concurrencyLimit: _defaultConcurrencyLimit,
 		maxBatchSize:     _defaultMaxBatchSize,
+		meter:            internal.Meter,
 	}
 
 	// options
 	for _, opt := range opts {
 		opt(engine)
 	}
+
+	engine.schemaCacheLookupsCounter = telemetry.NewCounter(engine.meter, "lookup_schema_cache_lookups", "Number of LookupEngine full-schema cache lookups, by result (hit or miss)")
+	engine.candidatesCounter = telemetry.NewCounter(engine.meter, "lookup_entity_candidates", "Number of candidate entities evaluated during LookupEntity and LookupEntityStream")
+	engine.matchedCounter = telemetry.NewCounter(engine.meter, "lookup_entity_matched", "Number of allowed entities matched during LookupEntity and LookupEntityStream")
 
 	return engine
 }
@@ -169,6 +183,8 @@ func (engine *LookupEngine) LookupEntity(ctx context.Context, request *base.Perm
 	}
 
 	// Return response containing allowed entity IDs
+	engine.candidatesCounter.Add(ctx, publisher.PublishedCount())
+	engine.matchedCounter.Add(ctx, int64(len(entityIDs)))
 	return &base.PermissionLookupEntityResponse{
 		EntityIds:       entityIDs,
 		ContinuousToken: ct,
@@ -183,9 +199,12 @@ func (engine *LookupEngine) LookupEntityStream(ctx context.Context, request *bas
 		size = 1000
 	}
 
+	var matchedCount atomic.Int64
+
 	// Define a callback function that will be called for each entity that passes the permission check.
 	// If the check result is allowed, it sends the entity ID to the server stream.
 	callback := func(entityID, token string) {
+		matchedCount.Add(1)
 		err := server.Send(&base.PermissionLookupEntityStreamResponse{
 			EntityId:        entityID,
 			ContinuousToken: token,
@@ -246,6 +265,9 @@ func (engine *LookupEngine) LookupEntityStream(ctx context.Context, request *bas
 	if err != nil {
 		return err
 	}
+
+	engine.candidatesCounter.Add(ctx, publisher.PublishedCount())
+	engine.matchedCounter.Add(ctx, matchedCount.Load())
 
 	return nil
 }
@@ -342,9 +364,11 @@ func (engine *LookupEngine) readSchema(ctx context.Context, tenantID, sharedSche
 
 	// Attempt to retrieve the schema from the cache (schemaMap) using the generated cacheKey.
 	if sch, ok := engine.schemaMap.Load(cacheKey); ok {
+		engine.schemaCacheLookupsCounter.Add(ctx, 1, lookupSchemaHitAttrs)
 		// If the schema is present in the cache, cast it to its correct type and return.
 		return sch.(*base.SchemaDefinition), nil
 	}
+	engine.schemaCacheLookupsCounter.Add(ctx, 1, lookupSchemaMissAttrs)
 
 	// If the schema is not present in the cache, use the schemaReader to read it from the source (e.g., a database or file).
 	sch, err := engine.schemaReader.ReadSchema(ctx, tenantID, sharedSchemaID, schemaVersion)

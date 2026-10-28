@@ -80,6 +80,9 @@ func TestRistretto_WithMetrics(t *testing.T) {
 	assert.Equal(t, int64(0), sumValue(t, metrics["cache_sets_dropped"], "schema"))
 	assert.Equal(t, int64(0), sumValue(t, metrics["cache_sets_rejected"], "schema"))
 	assert.Equal(t, int64(1), sumValue(t, metrics["cache_keys_added"], "permission"))
+	assert.Equal(t, int64(_defaultNumCounters), gaugeValue(t, metrics["cache_num_counters"], "schema"))
+	assert.Equal(t, int64(64), gaugeValue(t, metrics["cache_buffer_items"], "schema"))
+	assert.Positive(t, gaugeValue(t, metrics["cache_max_cost"], "schema"))
 	initialCost := gaugeValue(t, metrics["cache_cost_used"], "schema")
 	assert.Positive(t, initialCost)
 

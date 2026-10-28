@@ -2,6 +2,7 @@ package invoke
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 
@@ -70,6 +71,8 @@ type DirectInvoker struct {
 	sp SubjectPermission
 
 	checkCounter             metric.Int64Counter
+	checkErrorsCounter       metric.Int64Counter
+	expandCounter            metric.Int64Counter
 	lookupEntityCounter      metric.Int64Counter
 	lookupSubjectCounter     metric.Int64Counter
 	subjectPermissionCounter metric.Int64Counter
@@ -84,9 +87,30 @@ const (
 	otherSubjectType      = "__other__"
 )
 
-var otherSubjectTypeAttrs = metric.WithAttributeSet(attribute.NewSet(
-	attribute.String("subject_type", otherSubjectType),
-))
+var (
+	otherSubjectTypeAttrs = metric.WithAttributeSet(attribute.NewSet(
+		attribute.String("subject_type", otherSubjectType),
+	))
+
+	checkDepthErrorAttrs        = checkErrorReasonAttrs("depth_not_enough")
+	checkHeadSnapshotErrorAttrs = checkErrorReasonAttrs("head_snapshot")
+	checkHeadVersionErrorAttrs  = checkErrorReasonAttrs("head_version")
+	checkCancelledErrorAttrs    = checkErrorReasonAttrs("cancelled")
+	checkEngineErrorAttrs       = checkErrorReasonAttrs("engine")
+)
+
+func checkErrorReasonAttrs(reason string) metric.MeasurementOption {
+	return metric.WithAttributeSet(attribute.NewSet(attribute.String("reason", reason)))
+}
+
+func isCancelledError(ctx context.Context, err error) bool {
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return true
+	}
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		err.Error() == base.ErrorCode_ERROR_CODE_CANCELLED.String()
+}
 
 // DirectInvokerOption - Option type for DirectInvoker
 type DirectInvokerOption func(*directInvokerOptions)
@@ -128,6 +152,8 @@ func NewDirectInvoker(
 		sp:           sp,
 		checkCounter: telemetry.NewCounter(o.meter, "check", "Number of DirectInvoker.Check calls, including nested checks and failed checks"),
 
+		checkErrorsCounter:       telemetry.NewCounter(o.meter, "check_errors", "Number of failed DirectInvoker.Check calls, by reason"),
+		expandCounter:            telemetry.NewCounter(o.meter, "expand", "Number of expand calls, including engine errors"),
 		lookupEntityCounter:      telemetry.NewCounter(o.meter, "lookup_entity", "Number of lookup entity calls (unary and stream), including engine errors"),
 		lookupSubjectCounter:     telemetry.NewCounter(o.meter, "lookup_subject", "Number of lookup subject calls, including engine errors"),
 		subjectPermissionCounter: telemetry.NewCounter(o.meter, "subject_permission", "Number of subject permission calls, including engine errors"),
@@ -181,6 +207,7 @@ func (invoker *DirectInvoker) Check(ctx context.Context, request *BatchCheckRequ
 	// Validate the depth of the request.
 	err = checkDepth(request)
 	if err != nil {
+		invoker.checkErrorsCounter.Add(ctx, 1, checkDepthErrorAttrs)
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		span.SetAttributes(attribute.KeyValue{Key: "can", Value: attribute.StringValue(base.CheckResult_CHECK_RESULT_DENIED.String())})
@@ -192,6 +219,7 @@ func (invoker *DirectInvoker) Check(ctx context.Context, request *BatchCheckRequ
 		var st token.SnapToken
 		st, err = invoker.dataReader.HeadSnapshot(ctx, request.TenantID)
 		if err != nil {
+			invoker.checkErrorsCounter.Add(ctx, 1, checkHeadSnapshotErrorAttrs)
 			span.RecordError(err)
 			span.SetStatus(otelCodes.Error, err.Error())
 			span.SetAttributes(attribute.KeyValue{Key: "can", Value: attribute.StringValue(base.CheckResult_CHECK_RESULT_DENIED.String())})
@@ -204,6 +232,7 @@ func (invoker *DirectInvoker) Check(ctx context.Context, request *BatchCheckRequ
 	if request.Metadata.GetSchemaVersion() == "" {
 		request.Metadata.SharedSchemaId, request.Metadata.SchemaVersion, err = invoker.schemaReader.HeadVersion(ctx, request.TenantID)
 		if err != nil {
+			invoker.checkErrorsCounter.Add(ctx, 1, checkHeadVersionErrorAttrs)
 			span.RecordError(err)
 			span.SetStatus(otelCodes.Error, err.Error())
 			span.SetAttributes(attribute.KeyValue{Key: "can", Value: attribute.StringValue(base.CheckResult_CHECK_RESULT_DENIED.String())})
@@ -217,6 +246,11 @@ func (invoker *DirectInvoker) Check(ctx context.Context, request *BatchCheckRequ
 	// Perform the actual permission check using the provided request.
 	response, err = invoker.cc.Check(ctx, next)
 	if err != nil {
+		if isCancelledError(ctx, err) {
+			invoker.checkErrorsCounter.Add(ctx, 1, checkCancelledErrorAttrs)
+		} else {
+			invoker.checkErrorsCounter.Add(ctx, 1, checkEngineErrorAttrs)
+		}
 		span.RecordError(err)
 		span.SetStatus(otelCodes.Error, err.Error())
 		span.SetAttributes(attribute.KeyValue{Key: "can", Value: attribute.StringValue(base.CheckResult_CHECK_RESULT_DENIED.String())})
@@ -260,7 +294,11 @@ func (invoker *DirectInvoker) Expand(ctx context.Context, request *base.Permissi
 		}
 	}
 
-	return invoker.ec.Expand(ctx, request)
+	resp, err := invoker.ec.Expand(ctx, request)
+
+	invoker.expandCounter.Add(ctx, 1)
+
+	return resp, err
 }
 
 // LookupEntity is a method that implements the LookupEntity interface.

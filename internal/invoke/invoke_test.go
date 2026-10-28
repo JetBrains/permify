@@ -2,6 +2,7 @@ package invoke
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -20,6 +21,12 @@ type noopChecker struct{}
 
 func (noopChecker) Check(_ context.Context, request *BatchCheckRequest) (*BatchCheckResponse, error) {
 	return NewBatchCheckResponse(base.CheckResult_CHECK_RESULT_ALLOWED, request.EntityIDs...), nil
+}
+
+type noopExpand struct{}
+
+func (noopExpand) Expand(_ context.Context, _ *base.PermissionExpandRequest) (*base.PermissionExpandResponse, error) {
+	return &base.PermissionExpandResponse{}, nil
 }
 
 type noopLookup struct{}
@@ -64,7 +71,7 @@ func TestDirectInvokerCounters(t *testing.T) {
 		storage.NewNoopSchemaReader(),
 		storage.NewNoopRelationshipReader(),
 		noopChecker{},
-		nil,
+		noopExpand{},
 		noopLookup{},
 		noopSubjectPermission{},
 		WithMeter(meter),
@@ -121,9 +128,17 @@ func TestDirectInvokerCounters(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	_, err = invoker.Expand(ctx, &base.PermissionExpandRequest{
+		TenantId: "t1",
+		Metadata: &base.PermissionExpandRequestMetadata{SnapToken: "snap", SchemaVersion: "v1"},
+	})
+	require.NoError(t, err)
+
 	metrics := collectMetrics(t, reader)
 	for name, expected := range map[string]int64{
 		"check":              3,
+		"check_errors":       1,
+		"expand":             1,
 		"lookup_entity":      2,
 		"lookup_subject":     1,
 		"subject_permission": 1,
@@ -142,7 +157,82 @@ func TestDirectInvokerCounters(t *testing.T) {
 			assert.True(t, ok)
 			assert.Equal(t, "user", subjectType.AsString())
 		}
+		if name == "check_errors" {
+			reason, ok := sum.DataPoints[0].Attributes.Value(attribute.Key("reason"))
+			assert.True(t, ok)
+			assert.Equal(t, "depth_not_enough", reason.AsString())
+		}
 	}
+}
+
+type errChecker struct {
+	err error
+}
+
+func (c errChecker) Check(_ context.Context, _ *BatchCheckRequest) (*BatchCheckResponse, error) {
+	return nil, c.err
+}
+
+func TestDirectInvokerCheckErrorReasons(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+
+	invoker := NewDirectInvoker(
+		storage.NewNoopSchemaReader(),
+		storage.NewNoopRelationshipReader(),
+		errChecker{err: errors.New("datastore failure")},
+		noopExpand{},
+		noopLookup{},
+		noopSubjectPermission{},
+		WithMeter(meter),
+	)
+
+	// Engine error
+	_, err := invoker.Check(ctx, &BatchCheckRequest{
+		TenantID:   "t1",
+		EntityType: "doc",
+		EntityIDs:  []string{"1"},
+		Permission: "read",
+		Subject:    &base.Subject{Type: "user", Id: "alice"},
+		Metadata: &base.PermissionCheckRequestMetadata{
+			SnapToken:     "snap",
+			SchemaVersion: "v1",
+			Depth:         5,
+		},
+	})
+	require.Error(t, err)
+
+	// Cancelled error
+	invoker.cc = errChecker{err: errors.New(base.ErrorCode_ERROR_CODE_CANCELLED.String())}
+	_, err = invoker.Check(ctx, &BatchCheckRequest{
+		TenantID:   "t1",
+		EntityType: "doc",
+		EntityIDs:  []string{"1"},
+		Permission: "read",
+		Subject:    &base.Subject{Type: "user", Id: "alice"},
+		Metadata: &base.PermissionCheckRequestMetadata{
+			SnapToken:     "snap",
+			SchemaVersion: "v1",
+			Depth:         5,
+		},
+	})
+	require.Error(t, err)
+
+	metrics := collectMetrics(t, reader)
+	m, ok := metrics["check_errors"]
+	require.True(t, ok)
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	require.True(t, ok)
+	reasons := map[string]int64{}
+	for _, dp := range sum.DataPoints {
+		r, _ := dp.Attributes.Value(attribute.Key("reason"))
+		reasons[r.AsString()] = dp.Value
+	}
+	assert.Equal(t, map[string]int64{
+		"engine":    1,
+		"cancelled": 1,
+	}, reasons)
 }
 
 func TestDirectInvokerSubjectTypeCacheBound(t *testing.T) {

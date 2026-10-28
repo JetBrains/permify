@@ -2,13 +2,17 @@ package servers
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/Permify/permify/internal"
+	"github.com/Permify/permify/internal/invoke"
 	"github.com/Permify/permify/internal/storage"
 	"github.com/Permify/permify/pkg/database"
 	v1 "github.com/Permify/permify/pkg/pb/base/v1"
@@ -192,4 +196,104 @@ func TestServerCountersUseCounterInstruments(t *testing.T) {
 		require.Empty(t, sum.DataPoints[0].Attributes.ToSlice(), "metric %s should not have attributes", m.Name)
 		require.Equal(t, int64(1), sum.DataPoints[0].Value, "metric %s value mismatch", m.Name)
 	}
+}
+
+type failingInvoker struct {
+	invoke.Invoker
+}
+
+func (failingInvoker) Check(_ context.Context, _ *invoke.BatchCheckRequest) (*invoke.BatchCheckResponse, error) {
+	return nil, errors.New("engine error")
+}
+
+func TestServerSLOAndErrorCounters(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+	originalMeter := internal.Meter
+	internal.Meter = meter
+	defer func() { internal.Meter = originalMeter }()
+
+	bundleSrv := NewBundleServer(&stubBundleReader{}, storage.NewNoopBundleWriter())
+	tenancySrv := NewTenancyServer(storage.NewNoopTenantReader(), storage.NewNoopTenantWriter())
+	permSrv := NewPermissionServer(failingInvoker{}, 10, 1)
+
+	_, err := bundleSrv.Write(ctx, &v1.BundleWriteRequest{
+		TenantId: "t1",
+		Bundles:  []*v1.DataBundle{{Name: "b1"}},
+	})
+	require.NoError(t, err)
+
+	_, err = bundleSrv.Read(ctx, &v1.BundleReadRequest{TenantId: "t1", Name: "b1"})
+	require.NoError(t, err)
+
+	_, err = bundleSrv.Delete(ctx, &v1.BundleDeleteRequest{TenantId: "t1", Name: "b1"})
+	require.NoError(t, err)
+
+	// Invalid bundle request triggers bundle_server_errors
+	_, err = bundleSrv.Read(ctx, &v1.BundleReadRequest{})
+	require.Error(t, err)
+
+	_, err = tenancySrv.Create(ctx, &v1.TenantCreateRequest{Id: "t1", Name: "Tenant 1"})
+	require.NoError(t, err)
+
+	_, err = tenancySrv.Delete(ctx, &v1.TenantDeleteRequest{Id: "t1"})
+	require.NoError(t, err)
+
+	_, err = tenancySrv.List(ctx, &v1.TenantListRequest{})
+	require.NoError(t, err)
+
+	// Exceeding bulk_limit=1 triggers bulk_check_limit_exceeded and permission_server_errors
+	_, err = permSrv.BulkCheck(ctx, &v1.PermissionBulkCheckRequest{
+		TenantId: "t1",
+		Items: []*v1.PermissionBulkCheckRequestItem{
+			{Entity: &v1.Entity{Type: "doc", Id: "1"}, Permission: "view", Subject: &v1.Subject{Type: "user", Id: "1"}},
+			{Entity: &v1.Entity{Type: "doc", Id: "2"}, Permission: "view", Subject: &v1.Subject{Type: "user", Id: "1"}},
+		},
+	})
+	require.Error(t, err)
+
+	// Batch check failure inside BulkCheck triggers bulk_check_batch_errors and permission_server_errors
+	_, err = permSrv.BulkCheck(ctx, &v1.PermissionBulkCheckRequest{
+		TenantId: "t1",
+		Items: []*v1.PermissionBulkCheckRequestItem{
+			{Entity: &v1.Entity{Type: "doc", Id: "1"}, Permission: "view", Subject: &v1.Subject{Type: "user", Id: "1"}},
+		},
+	})
+	require.NoError(t, err)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+	metrics := map[string]metricdata.Metrics{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			assert.Empty(t, m.Unit)
+			metrics[m.Name] = m
+		}
+	}
+
+	for _, name := range []string{
+		"write_bundle",
+		"read_bundle",
+		"delete_bundle",
+		"create_tenant",
+		"delete_tenant",
+		"list_tenant",
+		"bulk_check_limit_exceeded",
+		"bulk_check_batch_errors",
+	} {
+		m, ok := metrics[name]
+		require.True(t, ok, "missing metric %s", name)
+		sum, ok := m.Data.(metricdata.Sum[int64])
+		require.True(t, ok)
+		require.Len(t, sum.DataPoints, 1)
+		assert.Equal(t, int64(1), sum.DataPoints[0].Value, "metric %s mismatch", name)
+	}
+
+	permErrSum, ok := metrics["permission_server_errors"].Data.(metricdata.Sum[int64])
+	require.True(t, ok)
+	require.Len(t, permErrSum.DataPoints, 1)
+	method, _ := permErrSum.DataPoints[0].Attributes.Value(attribute.Key("method"))
+	assert.Equal(t, "bulk_check", method.AsString())
+	assert.Equal(t, int64(2), permErrSum.DataPoints[0].Value)
 }

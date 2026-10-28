@@ -15,12 +15,31 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/Masterminds/squirrel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
+	"github.com/Permify/permify/internal"
 	"github.com/Permify/permify/internal/storage"
 	"github.com/Permify/permify/internal/storage/postgres/snapshot"
 	db "github.com/Permify/permify/pkg/database/postgres"
 	base "github.com/Permify/permify/pkg/pb/base/v1"
+	"github.com/Permify/permify/pkg/telemetry"
 )
+
+var (
+	watchEventOkAttrs    = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "ok")))
+	watchEventErrorAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "error")))
+)
+
+// WatchOption - Option type for Watch
+type WatchOption func(*Watch)
+
+// WithWatchMeter - Sets the meter used to create Watch metrics.
+func WithWatchMeter(meter metric.Meter) WatchOption {
+	return func(w *Watch) {
+		w.meter = meter
+	}
+}
 
 // Watch is an implementation of the storage.Watch interface, which is used
 type Watch struct {
@@ -32,14 +51,25 @@ type Watch struct {
 	// isolation level and read-only mode, to be applied when performing
 	// operations on the relationship data.
 	txOptions pgx.TxOptions
+
+	meter             metric.Meter
+	eventsCounter     metric.Int64Counter
+	bufferFullCounter metric.Int64Counter
 }
 
 // NewWatcher returns a new instance of the Watch.
-func NewWatcher(database *db.Postgres) *Watch {
-	return &Watch{
+func NewWatcher(database *db.Postgres, opts ...WatchOption) *Watch {
+	w := &Watch{
 		database:  database,
 		txOptions: pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly},
+		meter:     internal.Meter,
 	}
+	for _, opt := range opts {
+		opt(w)
+	}
+	w.eventsCounter = telemetry.NewCounter(w.meter, "watch_events", "Number of Watch transaction change batches processed, by result (ok or error)")
+	w.bufferFullCounter = telemetry.NewCounter(w.meter, "watch_buffer_full", "Number of times the Watch changes channel reached watch_buffer_size and blocked")
+	return w
 }
 
 // Watch returns a channel that emits a stream of changes to the relationship tuples in the database.
@@ -59,6 +89,7 @@ func (w *Watch) Watch(ctx context.Context, tenantID, snap string) (<-chan *base.
 	// The snapshot value represents a point in the history of the database.
 	st, err := snapshot.EncodedToken{Value: snap}.Decode()
 	if err != nil {
+		w.eventsCounter.Add(ctx, 1, watchEventErrorAttrs)
 		// If there is an error in decoding the snapshot, send the error and return.
 		errs <- err
 		// Log decode error
@@ -81,6 +112,7 @@ func (w *Watch) Watch(ctx context.Context, tenantID, snap string) (<-chan *base.
 			// Get the list of recent transaction IDs.
 			recentIDs, err := w.getRecentXIDs(ctx, cr, tenantID)
 			if err != nil {
+				w.eventsCounter.Add(ctx, 1, watchEventErrorAttrs)
 				// If there is an error in getting recent transaction IDs, send the error and return.
 				// Log transaction error
 				slog.Error("error getting recent transaction", slog.Any("error", err))
@@ -93,6 +125,7 @@ func (w *Watch) Watch(ctx context.Context, tenantID, snap string) (<-chan *base.
 				// Get the changes in the database associated with the current transaction ID.
 				updates, err := w.getChanges(ctx, id, tenantID)
 				if err != nil {
+					w.eventsCounter.Add(ctx, 1, watchEventErrorAttrs)
 					// If there is an error in getting the changes, send the error and return.
 					slog.ErrorContext(ctx, "failed to get changes for transaction", slog.Any("id", id), slog.Any("error", err))
 					errs <- err
@@ -106,7 +139,19 @@ func (w *Watch) Watch(ctx context.Context, tenantID, snap string) (<-chan *base.
 					errs <- errors.New(base.ErrorCode_ERROR_CODE_CANCELLED.String())
 					return
 				case changes <- updates: // Send updates to the changes channel.
+					w.eventsCounter.Add(ctx, 1, watchEventOkAttrs)
 					slog.DebugContext(ctx, "sent updates to the changes channel for transaction", slog.Any("id", id))
+				default:
+					w.bufferFullCounter.Add(ctx, 1)
+					select {
+					case <-ctx.Done():
+						slog.ErrorContext(ctx, "context canceled, stopping watch")
+						errs <- errors.New(base.ErrorCode_ERROR_CODE_CANCELLED.String())
+						return
+					case changes <- updates:
+						w.eventsCounter.Add(ctx, 1, watchEventOkAttrs)
+						slog.DebugContext(ctx, "sent updates to the changes channel for transaction", slog.Any("id", id))
+					}
 				}
 
 				// Update the transaction ID for the next round.

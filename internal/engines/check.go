@@ -7,7 +7,9 @@ import (
 	"sync"
 
 	"github.com/google/cel-go/cel"
+	"go.opentelemetry.io/otel/metric"
 
+	"github.com/Permify/permify/internal"
 	"github.com/Permify/permify/internal/invoke"
 	"github.com/Permify/permify/internal/schema"
 	"github.com/Permify/permify/internal/storage"
@@ -15,6 +17,7 @@ import (
 	"github.com/Permify/permify/pkg/database"
 	"github.com/Permify/permify/pkg/dsl/utils"
 	base "github.com/Permify/permify/pkg/pb/base/v1"
+	"github.com/Permify/permify/pkg/telemetry"
 	"github.com/Permify/permify/pkg/tuple"
 )
 
@@ -32,6 +35,11 @@ type CheckEngine struct {
 	concurrencyLimit int
 	// maxBatchSize is the maximum number of entity IDs per batch SQL query (IN clause)
 	maxBatchSize int
+
+	meter                   metric.Meter
+	batchSplitsCounter      metric.Int64Counter
+	concurrencyWaitsCounter metric.Int64Counter
+	celEvaluationsCounter   metric.Int64Counter
 }
 
 // NewCheckEngine creates a new CheckEngine instance for performing permission checks.
@@ -44,12 +52,17 @@ func NewCheckEngine(sr storage.SchemaReader, rr storage.DataReader, opts ...Chec
 		dataReader:       rr,
 		concurrencyLimit: _defaultConcurrencyLimit,
 		maxBatchSize:     _defaultMaxBatchSize,
+		meter:            internal.Meter,
 	}
 
 	// Apply provided options to configure the CheckEngine
 	for _, opt := range opts {
 		opt(engine)
 	}
+
+	engine.batchSplitsCounter = telemetry.NewCounter(engine.meter, "engine_batch_splits", "Number of times an entity or subject batch exceeded bulk_limit and was split into an additional batch, by engine")
+	engine.concurrencyWaitsCounter = telemetry.NewCounter(engine.meter, "concurrency_limit_waits", "Number of times a request had to wait for a concurrency limit slot, by scope")
+	engine.celEvaluationsCounter = telemetry.NewCounter(engine.meter, "cel_evaluations", "Number of CEL rule expression evaluations, by result")
 
 	return engine
 }
@@ -178,7 +191,7 @@ func (engine *CheckEngine) check(
 
 	// Otherwise, return a CheckFunction that checks a union of CheckFunctions.
 	return func(ctx context.Context) (*invoke.BatchCheckResponse, error) {
-		result, err := checkUnion(ctx, []CheckFunction{fn}, engine.concurrencyLimit, len(request.EntityIDs))
+		result, err := engine.checkUnion(ctx, []CheckFunction{fn}, engine.concurrencyLimit, len(request.EntityIDs))
 		if err != nil {
 			return result, err
 		}
@@ -200,15 +213,15 @@ func (engine *CheckEngine) checkRewrite(ctx context.Context, request *invoke.Bat
 	// In case of UNION operation, set the children CheckFunctions to be run concurrently
 	// and return the permission if any of the CheckFunctions succeeds (union).
 	case *base.Rewrite_OPERATION_UNION.Enum():
-		return engine.setChild(ctx, request, rewrite.GetChildren(), checkUnion)
+		return engine.setChild(ctx, request, rewrite.GetChildren(), engine.checkUnion)
 	// In case of INTERSECTION operation, set the children CheckFunctions to be run concurrently
 	// and return the permission if all the CheckFunctions succeed (intersection).
 	case *base.Rewrite_OPERATION_INTERSECTION.Enum():
-		return engine.setChild(ctx, request, rewrite.GetChildren(), checkIntersection)
+		return engine.setChild(ctx, request, rewrite.GetChildren(), engine.checkIntersection)
 	// In case of EXCLUSION operation, set the children CheckFunctions to be run concurrently
 	// and return the permission if the first CheckFunction succeeds and all others fail (exclusion).
 	case *base.Rewrite_OPERATION_EXCLUSION.Enum():
-		return engine.setChild(ctx, request, rewrite.GetChildren(), checkExclusion)
+		return engine.setChild(ctx, request, rewrite.GetChildren(), engine.checkExclusion)
 	// In case of an undefined child type, return a CheckFunction that always fails.
 	default:
 		return checkFail(errors.New(base.ErrorCode_ERROR_CODE_UNDEFINED_CHILD_TYPE.String()))
@@ -361,6 +374,9 @@ func (engine *CheckEngine) checkDirectRelation(request *invoke.BatchCheckRequest
 		for key, ids := range usersetGroups {
 			totalExpectedEntities += len(ids)
 			for i := 0; i < len(ids); i += engine.maxBatchSize {
+				if i > 0 {
+					engine.batchSplitsCounter.Add(ctx, 1, checkBatchSplitAttrs)
+				}
 				end := min(i+engine.maxBatchSize, len(ids))
 				checkFunctions = append(checkFunctions, engine.invoke(&invoke.BatchCheckRequest{
 					TenantID:   request.TenantID,
@@ -384,7 +400,7 @@ func (engine *CheckEngine) checkDirectRelation(request *invoke.BatchCheckRequest
 
 		// If there are userset check functions, run them and map results back to parent entities.
 		if len(checkFunctions) > 0 {
-			usersetResp, err := checkUnion(ctx, checkFunctions, engine.concurrencyLimit, totalExpectedEntities)
+			usersetResp, err := engine.checkUnion(ctx, checkFunctions, engine.concurrencyLimit, totalExpectedEntities)
 			if err != nil {
 				resp.Metadata = joinResponseMetas(resp.Metadata, usersetResp.Metadata)
 				return resp, err
@@ -467,6 +483,9 @@ func (engine *CheckEngine) checkTupleToUserSet(
 		for entityType, ids := range subjectsByType {
 			totalExpectedEntities += len(ids)
 			for i := 0; i < len(ids); i += engine.maxBatchSize {
+				if i > 0 {
+					engine.batchSplitsCounter.Add(ctx, 1, checkBatchSplitAttrs)
+				}
 				end := min(i+engine.maxBatchSize, len(ids))
 				checkFunctions = append(checkFunctions, engine.invoke(&invoke.BatchCheckRequest{
 					TenantID:   request.TenantID,
@@ -488,7 +507,7 @@ func (engine *CheckEngine) checkTupleToUserSet(
 			return resp, nil
 		}
 
-		subjectResp, err := checkUnion(ctx, checkFunctions, engine.concurrencyLimit, totalExpectedEntities)
+		subjectResp, err := engine.checkUnion(ctx, checkFunctions, engine.concurrencyLimit, totalExpectedEntities)
 		if err != nil {
 			resp.Metadata = joinResponseMetas(resp.Metadata, subjectResp.Metadata)
 			return resp, err
@@ -716,13 +735,16 @@ func (engine *CheckEngine) checkDirectCall(request *invoke.BatchCheckRequest) Ch
 			// Evaluate the rule expression with the arguments for this entity.
 			out, _, err := prg.Eval(arguments)
 			if err != nil {
+				engine.celEvaluationsCounter.Add(ctx, 1, celEvalErrorAttrs)
 				return resp, fmt.Errorf("failed to evaluate expression: %w", err)
 			}
 
 			result, ok := out.Value().(bool)
 			if !ok {
+				engine.celEvaluationsCounter.Add(ctx, 1, celEvalErrorAttrs)
 				return resp, fmt.Errorf("expected boolean result, but got %T", out.Value())
 			}
+			engine.celEvaluationsCounter.Add(ctx, 1, celEvalOkAttrs)
 
 			if result {
 				resp.Results[entityID] = base.CheckResult_CHECK_RESULT_ALLOWED
@@ -735,7 +757,7 @@ func (engine *CheckEngine) checkDirectCall(request *invoke.BatchCheckRequest) Ch
 
 // checkUnion checks if the subject has permission by running multiple CheckFunctions concurrently.
 // Per-entity merge: for each entityID, if ANY function returned ALLOWED -> ALLOWED, else -> DENIED.
-func checkUnion(ctx context.Context, functions []CheckFunction, limit int, expectedEntityCount int) (*invoke.BatchCheckResponse, error) {
+func (engine *CheckEngine) checkUnion(ctx context.Context, functions []CheckFunction, limit int, expectedEntityCount int) (*invoke.BatchCheckResponse, error) {
 	// Initialize the response metadata
 	responseMetadata := emptyResponseMetadata()
 
@@ -753,7 +775,7 @@ func checkUnion(ctx context.Context, functions []CheckFunction, limit int, expec
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	// Run the CheckFunctions concurrently
-	clean := checkRun(cancelCtx, functions, decisionChan, limit)
+	clean := engine.checkRun(cancelCtx, functions, decisionChan, limit)
 
 	// When the function returns, ensure to cancel the context and clean up the resources
 	defer func() {
@@ -823,7 +845,7 @@ func checkUnion(ctx context.Context, functions []CheckFunction, limit int, expec
 
 // checkIntersection checks if the subject has permission by running multiple CheckFunctions concurrently.
 // Per-entity merge: for each entityID, ALL functions must return ALLOWED -> ALLOWED, else -> DENIED.
-func checkIntersection(ctx context.Context, functions []CheckFunction, limit int, _ int) (*invoke.BatchCheckResponse, error) {
+func (engine *CheckEngine) checkIntersection(ctx context.Context, functions []CheckFunction, limit int, _ int) (*invoke.BatchCheckResponse, error) {
 	// Initialize the response metadata
 	responseMetadata := emptyResponseMetadata()
 
@@ -841,7 +863,7 @@ func checkIntersection(ctx context.Context, functions []CheckFunction, limit int
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	// Run the CheckFunctions concurrently
-	clean := checkRun(cancelCtx, functions, decisionChan, limit)
+	clean := engine.checkRun(cancelCtx, functions, decisionChan, limit)
 
 	// When the function returns, ensure to cancel the context and clean up the resources
 	defer func() {
@@ -931,7 +953,7 @@ func checkIntersection(ctx context.Context, functions []CheckFunction, limit int
 
 // checkExclusion is a function that checks if there are any exclusions for given CheckFunctions.
 // Per-entity merge: for each entityID, first function ALLOWED AND all remaining DENIED -> ALLOWED, else -> DENIED.
-func checkExclusion(ctx context.Context, functions []CheckFunction, limit int, _ int) (*invoke.BatchCheckResponse, error) {
+func (engine *CheckEngine) checkExclusion(ctx context.Context, functions []CheckFunction, limit int, _ int) (*invoke.BatchCheckResponse, error) {
 	// Initialize the response metadata
 	responseMetadata := emptyResponseMetadata()
 
@@ -963,7 +985,7 @@ func checkExclusion(ctx context.Context, functions []CheckFunction, limit int, _
 	}()
 
 	// Run the remaining functions concurrently
-	clean := checkRun(cancelCtx, functions[1:], decisionChan, limit)
+	clean := engine.checkRun(cancelCtx, functions[1:], decisionChan, limit)
 
 	// Ensure that all resources are properly cleaned up when the function exits
 	defer func() {
@@ -1094,7 +1116,7 @@ func checkExclusion(ctx context.Context, functions []CheckFunction, limit int, _
 // checkRun executes a list of CheckFunctions concurrently with a local concurrency limit.
 // DB-level concurrency is controlled by the semaphore DataReader proxy.
 // The local limit here prevents excessive goroutine fan-out and depth exhaustion.
-func checkRun(ctx context.Context, functions []CheckFunction, decisionChan chan<- CheckResponse, limit int) func() {
+func (engine *CheckEngine) checkRun(ctx context.Context, functions []CheckFunction, decisionChan chan<- CheckResponse, limit int) func() {
 	var wg sync.WaitGroup
 	cl := make(chan struct{}, limit)
 
@@ -1102,11 +1124,21 @@ func checkRun(ctx context.Context, functions []CheckFunction, decisionChan chan<
 	go func() {
 		defer wg.Done()
 		for _, fun := range functions {
+			if ctx.Err() != nil {
+				return
+			}
 			child := fun
 			select {
 			case cl <- struct{}{}:
 			case <-ctx.Done():
 				return
+			default:
+				engine.concurrencyWaitsCounter.Add(ctx, 1, checkConcurrencyWaitAttrs)
+				select {
+				case cl <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
 			}
 			wg.Add(1)
 			go func() {

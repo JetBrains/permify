@@ -2,10 +2,19 @@ package gc
 
 import (
 	"time"
+
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Option represents a function that configures a GC (Garbage Collector) instance.
 type Option func(gc *GC)
+
+// WithMeter sets the meter used to create the GC metrics. The default is internal.Meter.
+func WithMeter(meter metric.Meter) Option {
+	return func(gc *GC) {
+		gc.meter = meter
+	}
+}
 
 // Interval is an option that sets the interval duration for the GC.
 func Interval(n time.Duration) Option {

@@ -12,6 +12,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
+	"github.com/Permify/permify/internal/config"
 )
 
 func TestCircuitBreakerStateChangeRecorder(t *testing.T) {
@@ -73,4 +75,41 @@ func TestCircuitBreakerStateChangeRecorder(t *testing.T) {
 		"half-open->open":   1,
 		"half-open->closed": 1,
 	}, values)
+}
+
+func TestRegisterLimitMetrics(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+
+	cfg := config.DefaultConfig()
+	reg, err := registerLimitMetrics(meter, cfg)
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, reg.Unregister())
+	}()
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	require.Len(t, rm.ScopeMetrics, 1)
+
+	got := map[string]int64{}
+	for _, m := range rm.ScopeMetrics[0].Metrics {
+		assert.Empty(t, m.Unit, "metric %s should not have a unit", m.Name)
+		gauge, ok := m.Data.(metricdata.Gauge[int64])
+		require.True(t, ok, "metric %s should be Gauge[int64]", m.Name)
+		require.Len(t, gauge.DataPoints, 1)
+		got[m.Name] = gauge.DataPoints[0].Value
+	}
+
+	assert.Equal(t, map[string]int64{
+		"permission_bulk_limit":          int64(cfg.Service.Permission.BulkLimit),
+		"permission_concurrency_limit":   int64(cfg.Service.Permission.ConcurrencyLimit),
+		"server_rate_limit":              cfg.Server.RateLimit,
+		"database_max_connections":       int64(cfg.Database.MaxOpenConnections),
+		"database_min_connections":       int64(cfg.Database.MaxIdleConnections),
+		"database_max_data_per_write":    int64(cfg.Database.MaxDataPerWrite),
+		"database_max_retries":           int64(cfg.Database.MaxRetries),
+		"database_watch_buffer_size":     int64(cfg.Database.WatchBufferSize),
+		"authn_oidc_backoff_max_retries": int64(cfg.Authn.Oidc.BackoffMaxRetries),
+	}, got)
 }

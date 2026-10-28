@@ -9,6 +9,9 @@ import (
 
 // GetStatus - Get status code and message from error
 func GetStatus(err error) codes.Code {
+	if err == nil {
+		return codes.InvalidArgument
+	}
 	s, ok := status.FromError(err)
 	if ok {
 		// This was a custom error, so return its code directly

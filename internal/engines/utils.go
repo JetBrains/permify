@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 
+	otelAttribute "go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/Permify/permify/internal/invoke"
@@ -19,6 +21,20 @@ import (
 const (
 	_defaultConcurrencyLimit = 100
 	_defaultMaxBatchSize     = 100
+)
+
+var (
+	checkBatchSplitAttrs  = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("engine", "check")))
+	expandBatchSplitAttrs = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("engine", "expand")))
+
+	checkConcurrencyWaitAttrs  = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("scope", "check")))
+	expandConcurrencyWaitAttrs = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("scope", "expand")))
+
+	celEvalOkAttrs    = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("result", "ok")))
+	celEvalErrorAttrs = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("result", "error")))
+
+	lookupSchemaHitAttrs  = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("result", "hit")))
+	lookupSchemaMissAttrs = metric.WithAttributeSet(otelAttribute.NewSet(otelAttribute.String("result", "miss")))
 )
 
 // CheckOption - a functional option type for configuring the CheckEngine.
@@ -38,6 +54,13 @@ func CheckMaxBatchSize(size int) CheckOption {
 	}
 }
 
+// CheckMeter - a functional option that sets the meter for the CheckEngine metrics.
+func CheckMeter(meter metric.Meter) CheckOption {
+	return func(c *CheckEngine) {
+		c.meter = meter
+	}
+}
+
 type LookupOption func(engine *LookupEngine)
 
 func LookupConcurrencyLimit(limit int) LookupOption {
@@ -49,6 +72,12 @@ func LookupConcurrencyLimit(limit int) LookupOption {
 func LookupMaxBatchSize(size int) LookupOption {
 	return func(c *LookupEngine) {
 		c.maxBatchSize = size
+	}
+}
+
+func LookupMeter(meter metric.Meter) LookupOption {
+	return func(c *LookupEngine) {
+		c.meter = meter
 	}
 }
 
@@ -66,6 +95,13 @@ func ExpandConcurrencyLimit(limit int) ExpandOption {
 func ExpandMaxBatchSize(size int) ExpandOption {
 	return func(e *ExpandEngine) {
 		e.maxBatchSize = size
+	}
+}
+
+// ExpandMeter - a functional option that sets the meter for the ExpandEngine metrics.
+func ExpandMeter(meter metric.Meter) ExpandOption {
+	return func(e *ExpandEngine) {
+		e.meter = meter
 	}
 }
 

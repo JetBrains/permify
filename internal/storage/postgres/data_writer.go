@@ -9,6 +9,8 @@ import (
 
 	"github.com/Masterminds/squirrel"
 	"github.com/jackc/pgx/v5/pgconn"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/Permify/permify/internal"
@@ -19,22 +21,68 @@ import (
 	"github.com/Permify/permify/pkg/database"
 	db "github.com/Permify/permify/pkg/database/postgres"
 	base "github.com/Permify/permify/pkg/pb/base/v1"
+	"github.com/Permify/permify/pkg/telemetry"
 	"github.com/Permify/permify/pkg/token"
 	"github.com/Permify/permify/pkg/tuple"
 )
+
+var (
+	txWriteOpAttrs     = metric.WithAttributeSet(attribute.NewSet(attribute.String("op", "write")))
+	txDeleteOpAttrs    = metric.WithAttributeSet(attribute.NewSet(attribute.String("op", "delete")))
+	txRunBundleOpAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("op", "run_bundle")))
+
+	txWriteOkAttrs        = txResultAttrs("write", "ok")
+	txWriteErrorAttrs     = txResultAttrs("write", "error")
+	txDeleteOkAttrs       = txResultAttrs("delete", "ok")
+	txDeleteErrorAttrs    = txResultAttrs("delete", "error")
+	txRunBundleOkAttrs    = txResultAttrs("run_bundle", "ok")
+	txRunBundleErrorAttrs = txResultAttrs("run_bundle", "error")
+)
+
+func txResultAttrs(op, result string) metric.MeasurementOption {
+	return metric.WithAttributeSet(attribute.NewSet(
+		attribute.String("op", op),
+		attribute.String("result", result),
+	))
+}
+
+// DataWriterOption - Option type for DataWriter
+type DataWriterOption func(*DataWriter)
+
+// WithDataWriterMeter - Sets the meter used to create DataWriter metrics.
+func WithDataWriterMeter(meter metric.Meter) DataWriterOption {
+	return func(w *DataWriter) {
+		w.meter = meter
+	}
+}
 
 // DataWriter - Structure for Data Writer
 type DataWriter struct {
 	database *db.Postgres
 	// options
 	txOptions pgx.TxOptions
+
+	meter                      metric.Meter
+	txCounter                  metric.Int64Counter
+	txRetriesCounter           metric.Int64Counter
+	maxRetriesExceededCounter  metric.Int64Counter
+	maxDataPerWriteExcdCounter metric.Int64Counter
 }
 
-func NewDataWriter(database *db.Postgres) *DataWriter {
-	return &DataWriter{
+func NewDataWriter(database *db.Postgres, opts ...DataWriterOption) *DataWriter {
+	w := &DataWriter{
 		database:  database,
 		txOptions: pgx.TxOptions{IsoLevel: pgx.Serializable, AccessMode: pgx.ReadWrite},
+		meter:     internal.Meter,
 	}
+	for _, opt := range opts {
+		opt(w)
+	}
+	w.txCounter = telemetry.NewCounter(w.meter, "database_write_tx", "Number of DataWriter transactions, by operation and result")
+	w.txRetriesCounter = telemetry.NewCounter(w.meter, "database_tx_retries", "Number of PostgreSQL serializable transaction retries in DataWriter, by operation")
+	w.maxRetriesExceededCounter = telemetry.NewCounter(w.meter, "database_max_retries_exceeded", "Number of PostgreSQL transactions in DataWriter that failed after exhausting max_retries, by operation")
+	w.maxDataPerWriteExcdCounter = telemetry.NewCounter(w.meter, "database_max_data_per_write_exceeded", "Number of DataWriter.Write calls rejected because tuple and attribute count exceeded max_data_per_write")
+	return w
 }
 
 // Write method writes a collection of tuples and attributes to the database for a specific tenant.
@@ -54,6 +102,8 @@ func (w *DataWriter) Write(
 	// Validate data size
 	// Check if the total number of tuples and attributes exceeds the maximum allowed per write.
 	if len(tupleCollection.GetTuples())+len(attributeCollection.GetAttributes()) > w.database.GetMaxDataPerWrite() {
+		w.maxDataPerWriteExcdCounter.Add(ctx, 1)
+		w.txCounter.Add(ctx, 1, txWriteErrorAttrs)
 		return nil, errors.New(base.ErrorCode_ERROR_CODE_MAX_DATA_PER_WRITE_EXCEEDED.String())
 	}
 
@@ -64,17 +114,22 @@ func (w *DataWriter) Write(
 		if err != nil {
 			// Check if the error is due to serialization, and if so, retry.
 			if utils.IsSerializationRelatedError(err) || pgconn.SafeToRetry(err) {
+				w.txRetriesCounter.Add(ctx, 1, txWriteOpAttrs)
 				slog.WarnContext(ctx, "serialization error occurred", slog.String("tenant_id", tenantID), slog.Int("retry", i))
 				utils.WaitWithBackoff(ctx, tenantID, i)
 				continue // Retry the operation.
 			}
+			w.txCounter.Add(ctx, 1, txWriteErrorAttrs)
 			// If the error is not serialization-related, handle it and return.
 			return nil, utils.HandleError(ctx, span, err, base.ErrorCode_ERROR_CODE_DATASTORE)
 		}
+		w.txCounter.Add(ctx, 1, txWriteOkAttrs)
 		// If to write is successful, return the token.
 		return tkn, nil
 	}
 
+	w.maxRetriesExceededCounter.Add(ctx, 1, txWriteOpAttrs)
+	w.txCounter.Add(ctx, 1, txWriteErrorAttrs)
 	// Log an error if the operation failed after reaching the maximum number of retries.
 	slog.ErrorContext(ctx, "max retries reached", slog.Any("error", errors.New(base.ErrorCode_ERROR_CODE_ERROR_MAX_RETRIES.String())))
 	// Max retries exceeded
@@ -104,19 +159,24 @@ func (w *DataWriter) Delete(
 		if err != nil {
 			// Check if the error is due to serialization, and if so, retry.
 			if utils.IsSerializationRelatedError(err) || pgconn.SafeToRetry(err) {
+				w.txRetriesCounter.Add(ctx, 1, txDeleteOpAttrs)
 				slog.WarnContext(ctx, "serialization error occurred", slog.String("tenant_id", tenantID), slog.Int("retry", i))
 				utils.WaitWithBackoff(ctx, tenantID, i)
 				continue // Retry the operation.
 			}
+			w.txCounter.Add(ctx, 1, txDeleteErrorAttrs)
 			// If the error is not serialization-related, handle it and return.
 			return nil, utils.HandleError(ctx, span, err, base.ErrorCode_ERROR_CODE_DATASTORE)
 		}
+		w.txCounter.Add(ctx, 1, txDeleteOkAttrs)
 		// If the delete operation is successful, return the token.
 		return tkn, nil
 	}
 
+	w.maxRetriesExceededCounter.Add(ctx, 1, txDeleteOpAttrs)
+	w.txCounter.Add(ctx, 1, txDeleteErrorAttrs)
 	// Log an error if the operation failed after reaching the maximum number of retries.
-	slog.DebugContext(ctx, "max retries reached", slog.Any("error", errors.New(base.ErrorCode_ERROR_CODE_ERROR_MAX_RETRIES.String())))
+	slog.ErrorContext(ctx, "max retries reached", slog.Any("error", errors.New(base.ErrorCode_ERROR_CODE_ERROR_MAX_RETRIES.String())))
 	// Max retries exceeded
 	// Return an error indicating that the maximum number of retries has been reached.
 	return nil, errors.New(base.ErrorCode_ERROR_CODE_ERROR_MAX_RETRIES.String())
@@ -144,17 +204,22 @@ func (w *DataWriter) RunBundle(
 		if err != nil {
 			// Check if the error is due to serialization, and if so, retry.
 			if utils.IsSerializationRelatedError(err) || pgconn.SafeToRetry(err) {
+				w.txRetriesCounter.Add(ctx, 1, txRunBundleOpAttrs)
 				slog.WarnContext(ctx, "serialization error occurred", slog.String("tenant_id", tenantID), slog.Int("retry", i))
 				utils.WaitWithBackoff(ctx, tenantID, i)
 				continue // Retry the operation.
 			}
+			w.txCounter.Add(ctx, 1, txRunBundleErrorAttrs)
 			// If the error is not serialization-related, handle it and return.
 			return nil, utils.HandleError(ctx, span, err, base.ErrorCode_ERROR_CODE_DATASTORE)
 		}
+		w.txCounter.Add(ctx, 1, txRunBundleOkAttrs)
 		// If the operation is successful, return the token.
 		return tkn, nil
 	}
 
+	w.maxRetriesExceededCounter.Add(ctx, 1, txRunBundleOpAttrs)
+	w.txCounter.Add(ctx, 1, txRunBundleErrorAttrs)
 	// Log an error if the operation failed after reaching the maximum number of retries.
 	slog.ErrorContext(ctx, "max retries reached", slog.Any("error", errors.New(base.ErrorCode_ERROR_CODE_ERROR_MAX_RETRIES.String())))
 	// Max retries exceeded
