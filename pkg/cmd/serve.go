@@ -343,9 +343,17 @@ func serve() func(cmd *cobra.Command, args []string) error {
 			}()
 		}
 
+		// Ristretto internal metrics are exported only when the meter is enabled, because they add some overhead.
+		schemaCacheOptions := []ristretto.Option{ristretto.NumberOfCounters(cfg.Service.Schema.Cache.NumberOfCounters), ristretto.MaxCost(cfg.Service.Schema.Cache.MaxCost)}
+		engineKeyCacheOptions := []ristretto.Option{ristretto.NumberOfCounters(cfg.Service.Permission.Cache.NumberOfCounters), ristretto.MaxCost(cfg.Service.Permission.Cache.MaxCost)}
+		if cfg.Meter.Enabled {
+			schemaCacheOptions = append(schemaCacheOptions, ristretto.WithMetrics(internal.Meter, "schema"))
+			engineKeyCacheOptions = append(engineKeyCacheOptions, ristretto.WithMetrics(internal.Meter, "permission"))
+		}
+
 		// schema cache
 		var schemaCache pkgcache.Cache
-		schemaCache, err = ristretto.New(ristretto.NumberOfCounters(cfg.Service.Schema.Cache.NumberOfCounters), ristretto.MaxCost(cfg.Service.Schema.Cache.MaxCost))
+		schemaCache, err = ristretto.New(schemaCacheOptions...)
 		if err != nil {
 			slog.Error(err.Error())
 			return err
@@ -354,7 +362,7 @@ func serve() func(cmd *cobra.Command, args []string) error {
 
 		// engines cache cache
 		var engineKeyCache pkgcache.Cache
-		engineKeyCache, err = ristretto.New(ristretto.NumberOfCounters(cfg.Service.Permission.Cache.NumberOfCounters), ristretto.MaxCost(cfg.Service.Permission.Cache.MaxCost))
+		engineKeyCache, err = ristretto.New(engineKeyCacheOptions...)
 		if err != nil {
 			slog.Error(err.Error())
 			return err
