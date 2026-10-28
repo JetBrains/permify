@@ -103,3 +103,47 @@ func TestConsistentBalancerMetrics(t *testing.T) {
 		"unknown":           1,
 	}, subConnEvents)
 }
+
+func TestConsistentBalancerDoesNotReportSuccessWithoutSubConns(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+	clientConn := &mockClientConn{}
+	b := &Balancer{
+		clientConn:            clientConn,
+		subConnStates:         make(map[balancer.SubConn]connectivity.State),
+		connectivityEvaluator: &balancer.ConnectivityStateEvaluator{},
+		addressSubConns:       resolver.NewAddressMap(),
+		config:                &Config{PartitionCount: 100, ReplicationFactor: 3, Load: 1.25, PickerWidth: 2},
+		consistent: consistent.New(consistent.Config{
+			PartitionCount:    100,
+			ReplicationFactor: 3,
+			Load:              1.25,
+			Hasher:            xxhash.Sum64,
+		}),
+		resolverUpdatesCounter: telemetry.NewCounter(meter, "balancer_resolver_updates", "test"),
+		subConnEventsCounter:   telemetry.NewCounter(meter, "balancer_subconn_events", "test"),
+	}
+
+	require.NoError(t, b.UpdateClientConnState(balancer.ClientConnState{
+		ResolverState:  resolver.State{Addresses: []resolver.Address{{Addr: "127.0.0.1:50051"}}},
+		BalancerConfig: b.config,
+	}))
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	results := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "balancer_resolver_updates" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			for _, dp := range sum.DataPoints {
+				result, _ := dp.Attributes.Value(attribute.Key("result"))
+				results[result.AsString()] = dp.Value
+			}
+		}
+	}
+	assert.Equal(t, map[string]int64{"no_connections": 1}, results)
+}

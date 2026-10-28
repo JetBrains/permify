@@ -27,6 +27,7 @@ var (
 	resolverNoConfigAttrs         = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "no_config")))
 	resolverTransientFailureAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "transient_failure")))
 	resolverErrorAttrs            = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "resolver_error")))
+	resolverNoConnectionsAttrs    = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "no_connections")))
 
 	subConnCreatedAttrs          = metric.WithAttributeSet(attribute.NewSet(attribute.String("event", "created")))
 	subConnCreateFailedAttrs     = metric.WithAttributeSet(attribute.NewSet(attribute.String("event", "create_failed")))
@@ -219,6 +220,9 @@ func (b *Balancer) UpdateClientConnState(s balancer.ClientConnState) error {
 	if b.state == connectivity.TransientFailure {
 		b.recordResolverUpdate(resolverTransientFailureAttrs)
 		slog.Warn("Transient failure detected")
+		b.picker.Store(nil)
+	} else if len(b.consistent.Members()) == 0 {
+		b.recordResolverUpdate(resolverNoConnectionsAttrs)
 		b.picker.Store(nil)
 	} else {
 		width := b.config.PickerWidth
