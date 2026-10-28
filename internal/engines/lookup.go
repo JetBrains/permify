@@ -3,6 +3,7 @@ package engines
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
@@ -206,6 +207,8 @@ func (engine *LookupEngine) LookupEntityStream(ctx context.Context, request *bas
 	}
 
 	var matchedCount atomic.Int64
+	sendErrorCh := make(chan error, 1)
+	var checker *BulkChecker
 
 	// Define a callback function that will be called for each entity that passes the permission check.
 	// If the check result is allowed, it sends the entity ID to the server stream.
@@ -216,6 +219,14 @@ func (engine *LookupEngine) LookupEntityStream(ctx context.Context, request *bas
 		})
 		// If there is an error in sending the response, the function will return
 		if err != nil {
+			slog.ErrorContext(ctx, "failed to send lookup entity stream response", "tenant_id", request.GetTenantId(), "error", err.Error())
+			select {
+			case sendErrorCh <- err:
+			default:
+			}
+			if checker != nil {
+				checker.Close()
+			}
 			return
 		}
 		matchedCount.Add(1)
@@ -228,7 +239,7 @@ func (engine *LookupEngine) LookupEntityStream(ctx context.Context, request *bas
 	}
 
 	// Create and start BulkChecker. It performs permission checks concurrently.
-	checker, err := NewBulkChecker(ctx, engine.checkEngine, BulkCheckerTypeEntity, callback, config)
+	checker, err = NewBulkChecker(ctx, engine.checkEngine, BulkCheckerTypeEntity, callback, config)
 	if err != nil {
 		return fmt.Errorf("failed to create bulk checker: %w", err)
 	}
@@ -274,7 +285,17 @@ func (engine *LookupEngine) LookupEntityStream(ctx context.Context, request *bas
 
 	err = checker.ExecuteRequests(size)
 	if err != nil {
+		select {
+		case sendErr := <-sendErrorCh:
+			return sendErr
+		default:
+		}
 		return err
+	}
+	select {
+	case err := <-sendErrorCh:
+		return err
+	default:
 	}
 
 	return nil

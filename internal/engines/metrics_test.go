@@ -2,6 +2,7 @@ package engines
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/Permify/permify/internal/config"
 	"github.com/Permify/permify/internal/factories"
@@ -21,6 +23,20 @@ import (
 	"github.com/Permify/permify/pkg/token"
 	"github.com/Permify/permify/pkg/tuple"
 )
+
+type lookupMetricsTestStream struct {
+	err error
+}
+
+func (s *lookupMetricsTestStream) Send(*base.PermissionLookupEntityStreamResponse) error {
+	return s.err
+}
+func (s *lookupMetricsTestStream) SetHeader(metadata.MD) error  { return nil }
+func (s *lookupMetricsTestStream) SendHeader(metadata.MD) error { return nil }
+func (s *lookupMetricsTestStream) SetTrailer(metadata.MD)       {}
+func (s *lookupMetricsTestStream) Context() context.Context     { return context.Background() }
+func (s *lookupMetricsTestStream) SendMsg(any) error            { return nil }
+func (s *lookupMetricsTestStream) RecvMsg(any) error            { return nil }
 
 func collectEngineMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[string]metricdata.Metrics {
 	t.Helper()
@@ -143,6 +159,16 @@ entity doc {
 		assert.ElementsMatch(t, []string{"1", "2"}, resp.GetEntityIds())
 	}
 
+	streamErr := errors.New("stream closed")
+	err = lookupEngine.LookupEntityStream(ctx, &base.PermissionLookupEntityRequest{
+		TenantId:   "t1",
+		EntityType: "doc",
+		Permission: "view",
+		Subject:    &base.Subject{Type: "user", Id: "alice"},
+		Metadata:   &base.PermissionLookupEntityRequestMetadata{SnapToken: snap, SchemaVersion: "v1", Depth: 20},
+	}, &lookupMetricsTestStream{err: streamErr})
+	require.ErrorIs(t, err, streamErr)
+
 	metrics := collectEngineMetrics(t, reader)
 
 	// Verify engine_batch_splits for both check and expand
@@ -166,7 +192,7 @@ entity doc {
 	}
 	assert.Positive(t, celByResult["ok"])
 
-	// Verify lookup_schema_cache_lookups (1 miss, 1 hit)
+	// Verify lookup_schema_cache_lookups (1 miss, 2 hits including LookupEntityStream)
 	lookupSchemaSum, ok := metrics["lookup_schema_cache_lookups"].Data.(metricdata.Sum[int64])
 	require.True(t, ok)
 	lookupSchemaByResult := map[string]int64{}
@@ -174,18 +200,18 @@ entity doc {
 		res, _ := dp.Attributes.Value(attribute.Key("result"))
 		lookupSchemaByResult[res.AsString()] = dp.Value
 	}
-	assert.Equal(t, map[string]int64{"miss": 1, "hit": 1}, lookupSchemaByResult)
+	assert.Equal(t, map[string]int64{"miss": 1, "hit": 2}, lookupSchemaByResult)
 
-	// Verify lookup_entity_candidates, lookup_entity_checked and lookup_entity_matched
+	// Verify lookup_entity_candidates and lookup_entity_matched
 	candSum, ok := metrics["lookup_entity_candidates"].Data.(metricdata.Sum[int64])
 	require.True(t, ok)
 	require.Len(t, candSum.DataPoints, 1)
-	assert.Equal(t, int64(4), candSum.DataPoints[0].Value)
+	assert.Equal(t, int64(6), candSum.DataPoints[0].Value)
 
 	checkedSum, ok := metrics["lookup_entity_checked"].Data.(metricdata.Sum[int64])
 	require.True(t, ok)
 	require.Len(t, checkedSum.DataPoints, 1)
-	assert.Equal(t, int64(4), checkedSum.DataPoints[0].Value)
+	assert.Equal(t, int64(6), checkedSum.DataPoints[0].Value)
 
 	matchedSum, ok := metrics["lookup_entity_matched"].Data.(metricdata.Sum[int64])
 	require.True(t, ok)
