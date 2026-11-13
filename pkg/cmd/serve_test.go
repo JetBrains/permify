@@ -113,7 +113,66 @@ func TestRegisterLimitMetrics(t *testing.T) {
 		"database_max_retries":           int64(cfg.Database.MaxRetries),
 		"database_watch_buffer_size":     int64(cfg.Database.WatchBufferSize),
 		"authn_oidc_backoff_max_retries": int64(cfg.Authn.Oidc.BackoffMaxRetries),
+		"gc_enabled":                     0,
+		"gc_interval_seconds":            0,
+		"gc_window_seconds":              0,
+		"gc_timeout_seconds":             0,
 	}, got)
+}
+
+func TestRegisterLimitMetricsReportsEffectiveGCConfiguration(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+	cfg := config.DefaultConfig()
+	cfg.Database.Engine = "postgres"
+	cfg.Database.GarbageCollection.Enabled = true
+	cfg.Database.GarbageCollection.Interval = 2 * time.Hour
+	cfg.Database.GarbageCollection.Window = 2 * time.Hour
+	cfg.Database.GarbageCollection.Timeout = 5 * time.Minute
+
+	reg, err := registerLimitMetrics(meter, cfg, nil)
+	require.NoError(t, err)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	got := map[string]int64{}
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "gc_enabled" && m.Name != "gc_interval_seconds" && m.Name != "gc_window_seconds" && m.Name != "gc_timeout_seconds" {
+				continue
+			}
+			gauge, ok := m.Data.(metricdata.Gauge[int64])
+			require.True(t, ok)
+			require.Len(t, gauge.DataPoints, 1)
+			got[m.Name] = gauge.DataPoints[0].Value
+		}
+	}
+	assert.Equal(t, map[string]int64{
+		"gc_enabled":          1,
+		"gc_interval_seconds": 7200,
+		"gc_window_seconds":   7200,
+		"gc_timeout_seconds":  300,
+	}, got)
+	require.NoError(t, reg.Unregister())
+
+	cfg.Database.Engine = "memory"
+	reg, err = registerLimitMetrics(meter, cfg, nil)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, reg.Unregister()) }()
+
+	rm = metricdata.ResourceMetrics{}
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "gc_enabled" {
+				continue
+			}
+			gauge, ok := m.Data.(metricdata.Gauge[int64])
+			require.True(t, ok)
+			require.Len(t, gauge.DataPoints, 1)
+			assert.Zero(t, gauge.DataPoints[0].Value)
+		}
+	}
 }
 
 func TestRegisterLimitMetricsUsesEffectivePoolSettings(t *testing.T) {

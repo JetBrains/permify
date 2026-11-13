@@ -79,9 +79,11 @@ func (r *Ristretto) registerMetrics(maxCost uint64) error {
 		{name: "cache_cost_evicted", description: "Sum of the costs of the keys evicted from the cache", value: (*ristretto.Metrics).CostEvicted},
 		{name: "cache_sets_dropped", description: "Number of cache Set calls dropped because the set buffer was full", value: (*ristretto.Metrics).SetsDropped},
 		{name: "cache_sets_rejected", description: "Number of cache Set calls rejected by the admission policy", value: (*ristretto.Metrics).SetsRejected},
+		{name: "cache_gets_kept", description: "Number of Get operations retained for TinyLFU frequency tracking", value: (*ristretto.Metrics).GetsKept},
+		{name: "cache_gets_dropped", description: "Number of Get operations dropped from TinyLFU frequency tracking", value: (*ristretto.Metrics).GetsDropped},
 	}
 
-	instruments := make([]metric.Observable, 0, len(counters)+4)
+	instruments := make([]metric.Observable, 0, len(counters)+5)
 	for _, counter := range counters {
 		instrument, err := r.meter.Int64ObservableCounter(
 			counter.name,
@@ -130,6 +132,15 @@ func (r *Ristretto) registerMetrics(maxCost uint64) error {
 	}
 	instruments = append(instruments, bufferItemsGauge)
 
+	keysGauge, err := r.meter.Int64ObservableGauge(
+		"cache_keys",
+		metric.WithDescription("Estimated current number of keys in the cache (keys added minus keys evicted)"),
+	)
+	if err != nil {
+		return err
+	}
+	instruments = append(instruments, keysGauge)
+
 	attrs := metric.WithAttributeSet(attribute.NewSet(attribute.String("cache", r.name)))
 	metrics := r.c.Metrics
 	configuredMaxCost := toInt64(maxCost)
@@ -140,6 +151,12 @@ func (r *Ristretto) registerMetrics(maxCost uint64) error {
 		for _, counter := range counters {
 			o.ObserveInt64(counter.instrument, toInt64(counter.value(metrics)), attrs)
 		}
+		addedKeys, evictedKeys := metrics.KeysAdded(), metrics.KeysEvicted()
+		keys := int64(0)
+		if addedKeys > evictedKeys {
+			keys = toInt64(addedKeys - evictedKeys)
+		}
+		o.ObserveInt64(keysGauge, keys, attrs)
 		added, evicted := metrics.CostAdded(), metrics.CostEvicted()
 		used := int64(0)
 		if added > evicted {

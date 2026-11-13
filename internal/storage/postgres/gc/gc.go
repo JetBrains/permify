@@ -20,8 +20,11 @@ import (
 )
 
 var (
-	gcOkAttrs    = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "ok")))
-	gcErrorAttrs = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "error")))
+	gcOkAttrs                 = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "ok")))
+	gcErrorAttrs              = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "error")))
+	gcRelationTuplesTableAttr = metric.WithAttributeSet(attribute.NewSet(attribute.String("table", postgres.RelationTuplesTable)))
+	gcAttributesTableAttr     = metric.WithAttributeSet(attribute.NewSet(attribute.String("table", postgres.AttributesTable)))
+	gcTransactionsTableAttr   = metric.WithAttributeSet(attribute.NewSet(attribute.String("table", postgres.TransactionsTable)))
 )
 
 // GC represents a Garbage Collector configuration for database cleanup.
@@ -38,6 +41,9 @@ type GC struct {
 	meter             metric.Meter
 	runsCounter       metric.Int64Counter
 	tenantRunsCounter metric.Int64Counter
+	runDuration       metric.Float64Histogram
+	deletedRows       metric.Int64Counter
+	lastSuccess       metric.Int64Gauge
 }
 
 // NewGC creates a new GC instance with the provided configuration.
@@ -57,6 +63,22 @@ func NewGC(db *db.Postgres, opts ...Option) *GC {
 
 	gc.runsCounter = telemetry.NewCounter(gc.meter, "gc_runs", "Number of database garbage collection cycles, by result (ok or error)")
 	gc.tenantRunsCounter = telemetry.NewCounter(gc.meter, "gc_tenant_runs", "Number of per-tenant database garbage collection executions, by result (ok or error)")
+	var err error
+	gc.runDuration, err = gc.meter.Float64Histogram(
+		"gc_run_duration_seconds",
+		metric.WithDescription("Duration of database garbage collection cycles in seconds, by result"),
+	)
+	if err != nil {
+		panic(err)
+	}
+	gc.deletedRows = telemetry.NewCounter(gc.meter, "gc_deleted_rows", "Number of rows deleted by database garbage collection, by table")
+	gc.lastSuccess, err = gc.meter.Int64Gauge(
+		"gc_last_success_timestamp_seconds",
+		metric.WithDescription("Unix timestamp in seconds of the most recent successful database garbage collection cycle"),
+	)
+	if err != nil {
+		panic(err)
+	}
 
 	return gc
 }
@@ -85,29 +107,44 @@ func (gc *GC) Start(ctx context.Context) error {
 func (gc *GC) Run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), gc.timeout)
 	defer cancel()
+	return gc.runWithMetrics(ctx, func() error {
+		// Get the current time from the database timezone.
+		var dbNow time.Time
+		err := gc.database.WritePool.QueryRow(ctx, "SELECT NOW() AT TIME ZONE 'UTC'").Scan(&dbNow)
+		if err != nil {
+			slog.Error("Failed to get current time from database", slog.Any("error", err))
+			return err
+		}
 
-	// Get the current time from the database timezone.
-	var dbNow time.Time
-	err := gc.database.WritePool.QueryRow(ctx, "SELECT NOW() AT TIME ZONE 'UTC'").Scan(&dbNow)
-	if err != nil {
-		gc.runsCounter.Add(ctx, 1, gcErrorAttrs)
-		slog.Error("Failed to get current time from database", slog.Any("error", err))
-		return err
-	}
+		// Calculate the cutoff timestamp based on the window duration.
+		cutoffTime := dbNow.Add(-gc.window)
 
-	// Calculate the cutoff timestamp based on the window duration.
-	cutoffTime := dbNow.Add(-gc.window)
+		// Get all tenants for tenant-specific garbage collection
+		tenants, err := gc.getAllTenants(ctx)
+		if err != nil {
+			slog.Error("Failed to retrieve tenants:", slog.Any("error", err))
+			return err
+		}
 
-	// Get all tenants for tenant-specific garbage collection
-	tenants, err := gc.getAllTenants(ctx)
-	if err != nil {
-		gc.runsCounter.Add(ctx, 1, gcErrorAttrs)
-		slog.Error("Failed to retrieve tenants:", slog.Any("error", err))
-		return err
-	}
+		// Process garbage collection for each tenant individually
+		return gc.runTenants(ctx, tenants, cutoffTime, gc.runForTenant)
+	})
+}
 
-	// Process garbage collection for each tenant individually
-	return gc.runTenants(ctx, tenants, cutoffTime, gc.runForTenant)
+func (gc *GC) runWithMetrics(ctx context.Context, run func() error) (runErr error) {
+	started := time.Now()
+	defer func() {
+		attrs := gcOkAttrs
+		if runErr != nil {
+			attrs = gcErrorAttrs
+		}
+		gc.runsCounter.Add(ctx, 1, attrs)
+		gc.runDuration.Record(ctx, time.Since(started).Seconds(), attrs)
+		if runErr == nil {
+			gc.lastSuccess.Record(ctx, time.Now().Unix())
+		}
+	}()
+	return run()
 }
 
 func (gc *GC) runTenants(ctx context.Context, tenants []string, cutoffTime time.Time, runTenant func(context.Context, string, time.Time) error) error {
@@ -123,16 +160,7 @@ func (gc *GC) runTenants(ctx context.Context, tenants []string, cutoffTime time.
 		gc.tenantRunsCounter.Add(ctx, 1, gcOkAttrs)
 	}
 
-	return gc.recordRunResult(ctx, tenantErrors)
-}
-
-func (gc *GC) recordRunResult(ctx context.Context, tenantErrors []error) error {
-	if err := errors.Join(tenantErrors...); err != nil {
-		gc.runsCounter.Add(ctx, 1, gcErrorAttrs)
-		return err
-	}
-	gc.runsCounter.Add(ctx, 1, gcOkAttrs)
-	return nil
+	return errors.Join(tenantErrors...)
 }
 
 // getAllTenants retrieves all tenant IDs from the tenants table.
@@ -237,8 +265,12 @@ func (gc *GC) deleteRecordsForTenant(ctx context.Context, table, tenantID string
 		return err
 	}
 
-	_, err = gc.database.WritePool.Exec(ctx, query, args...)
-	return err
+	commandTag, err := gc.database.WritePool.Exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	gc.recordDeletedRows(ctx, table, commandTag.RowsAffected())
+	return nil
 }
 
 // deleteTransactionsForTenant deletes transactions for a specific tenant older than the provided lastTransactionID.
@@ -262,6 +294,23 @@ func (gc *GC) deleteTransactionsForTenant(ctx context.Context, tenantID string, 
 	}
 
 	// Execute the DELETE query with the provided context.
-	_, err = gc.database.WritePool.Exec(ctx, query, args...)
-	return err
+	commandTag, err := gc.database.WritePool.Exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	gc.recordDeletedRows(ctx, postgres.TransactionsTable, commandTag.RowsAffected())
+	return nil
+}
+
+func (gc *GC) recordDeletedRows(ctx context.Context, table string, rows int64) {
+	switch table {
+	case postgres.RelationTuplesTable:
+		gc.deletedRows.Add(ctx, rows, gcRelationTuplesTableAttr)
+	case postgres.AttributesTable:
+		gc.deletedRows.Add(ctx, rows, gcAttributesTableAttr)
+	case postgres.TransactionsTable:
+		gc.deletedRows.Add(ctx, rows, gcTransactionsTableAttr)
+	default:
+		gc.deletedRows.Add(ctx, rows, metric.WithAttributes(attribute.String("table", table)))
+	}
 }

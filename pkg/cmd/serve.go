@@ -717,6 +717,30 @@ func registerLimitMetrics(meter otelmetric.Meter, cfg *config.Config, postgresDB
 			description:  "Configured maximum number of OIDC JWKS fetch retries within a backoff interval",
 			observations: []limitObservation{{value: int64(cfg.Authn.Oidc.BackoffMaxRetries)}},
 		},
+		{
+			name:        "gc_enabled",
+			description: "Whether PostgreSQL garbage collection is effectively enabled",
+			observations: []limitObservation{{value: boolToInt64(
+				cfg.Database.GarbageCollection.Enabled &&
+					cfg.Database.GarbageCollection.Timeout > 0 &&
+					cfg.Database.Engine != "memory",
+			)}},
+		},
+		{
+			name:         "gc_interval_seconds",
+			description:  "Configured interval between PostgreSQL garbage collection runs, in seconds",
+			observations: []limitObservation{{value: int64(cfg.Database.GarbageCollection.Interval.Seconds())}},
+		},
+		{
+			name:         "gc_window_seconds",
+			description:  "Configured age window for PostgreSQL garbage collection, in seconds",
+			observations: []limitObservation{{value: int64(cfg.Database.GarbageCollection.Window.Seconds())}},
+		},
+		{
+			name:         "gc_timeout_seconds",
+			description:  "Configured maximum duration of a PostgreSQL garbage collection run, in seconds",
+			observations: []limitObservation{{value: int64(cfg.Database.GarbageCollection.Timeout.Seconds())}},
+		},
 	}
 
 	instruments := make([]otelmetric.Observable, 0, len(gauges))
@@ -741,6 +765,13 @@ func registerLimitMetrics(meter otelmetric.Meter, cfg *config.Config, postgresDB
 		}
 		return nil
 	}, instruments...)
+}
+
+func boolToInt64(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // getLogLevel converts a string representation of log level to its corresponding slog.Level value.

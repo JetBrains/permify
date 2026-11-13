@@ -1,6 +1,7 @@
 package ristretto
 
 import (
+	"context"
 	"runtime"
 	"strings"
 	"testing"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestRistretto(t *testing.T) {
@@ -113,4 +116,34 @@ func TestRistretto_CloseStopsBackgroundGoroutines(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return countRistrettoGoroutines() == before
 	}, time.Second, 5*time.Millisecond, "ristretto background goroutines leaked after Close()")
+}
+
+func TestRistrettoMetricsExposeKeyCountAndGetTracking(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+	cache, err := New(NumberOfCounters(100), WithMetrics(meter, "permission"))
+	require.NoError(t, err)
+	t.Cleanup(cache.Close)
+
+	require.True(t, cache.Set("key", "value", 1))
+	cache.Wait()
+	_, _ = cache.Get("key")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	metrics := map[string]metricdata.Metrics{}
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			metrics[m.Name] = m
+		}
+	}
+
+	keys, ok := metrics["cache_keys"]
+	require.True(t, ok)
+	gauge, ok := keys.Data.(metricdata.Gauge[int64])
+	require.True(t, ok)
+	require.Len(t, gauge.DataPoints, 1)
+	assert.Equal(t, int64(1), gauge.DataPoints[0].Value)
+	assert.Contains(t, metrics, "cache_gets_kept")
+	assert.Contains(t, metrics, "cache_gets_dropped")
 }

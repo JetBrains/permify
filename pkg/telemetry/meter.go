@@ -21,6 +21,11 @@ import (
 	"github.com/Permify/permify/internal"
 )
 
+var durationHistogramAggregation = metric.AggregationBase2ExponentialHistogram{
+	MaxSize:  160,
+	MaxScale: 20,
+}
+
 // NewMeter - Creates new meter
 func NewMeter(exporter metric.Exporter, interval time.Duration) func(context.Context) error {
 	hostName, err := os.Hostname()
@@ -33,6 +38,7 @@ func NewMeter(exporter metric.Exporter, interval time.Duration) func(context.Con
 			exporter,
 			metric.WithInterval(interval),
 		)),
+		metric.WithView(HistogramViews()...),
 		metric.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String("permify"),
@@ -59,6 +65,24 @@ func NewMeter(exporter metric.Exporter, interval time.Duration) func(context.Con
 	otel.SetMeterProvider(mp)
 
 	return mp.Shutdown
+}
+
+// HistogramViews configures duration histograms to use exponential buckets.
+func HistogramViews() []metric.View {
+	return []metric.View{
+		metric.NewView(
+			metric.Instrument{Name: "gc_run_duration_seconds", Kind: metric.InstrumentKindHistogram},
+			metric.Stream{Aggregation: durationHistogramAggregation},
+		),
+		metric.NewView(
+			metric.Instrument{Kind: metric.InstrumentKindHistogram, Unit: "s"},
+			metric.Stream{Aggregation: durationHistogramAggregation},
+		),
+		metric.NewView(
+			metric.Instrument{Kind: metric.InstrumentKindHistogram, Unit: "ms"},
+			metric.Stream{Aggregation: durationHistogramAggregation},
+		),
+	}
 }
 
 // NewNoopMeter - Creates new noop meter
