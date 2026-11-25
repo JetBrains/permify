@@ -99,6 +99,8 @@ func NewCheckEngineWithBalancer(
 		return nil, err
 	}
 
+	conn.Connect()
+
 	return &Balancer{
 		schemaReader: schemaReader,
 		checker:      checker,

@@ -136,7 +136,9 @@ func (b *builder) Build(cc balancer.ClientConn, _ balancer.BuildOptions) balance
 // Picker returns the current NodePicker. Nil if the balancer is not ready.
 func (b *builder) Picker() NodePicker {
 	if bal := b.bal.Load(); bal != nil {
-		return bal.picker.Load()
+		if p := bal.picker.Load(); p != nil {
+			return p
+		}
 	}
 	return nil
 }
